@@ -1,0 +1,127 @@
+{
+  "enable_poll": {
+    "description": "【总开关】启用「MC → QQ」定时拉取",
+    "type": "bool",
+    "default": true,
+    "hint": "关掉后群里仍可用 #mc 命令往服务器发消息，但服务器里的消息不会再自动推到群里。"
+  },
+  "mc_base_url": {
+    "description": "【必填】Paper 插件的 HTTP 接口地址",
+    "type": "string",
+    "default": "http://127.0.0.1:8123",
+    "hint": "对应 McQqChatPool 插件 config.yml 里的 http.host 与 http.port。若 AstrBot 跑在 Docker 里，这里要填 http://host.docker.internal:8123（Docker Desktop 下服务器插件保持 127.0.0.1 即可；Linux Docker 才需要把插件改成 0.0.0.0）。"
+  },
+  "mc_token": {
+    "description": "【必填】访问令牌",
+    "type": "string",
+    "default": "",
+    "hint": "必须与服务器 plugins/McQqChatPool/config.yml 里的 http.token 完全一致，否则接口会返回 401。"
+  },
+  "poll_interval_seconds": {
+    "description": "拉取间隔（秒）",
+    "type": "int",
+    "default": 5,
+    "hint": "每隔多少秒向服务器要一次新消息。太小会增加服务器负担，建议 3-10 秒。"
+  },
+  "poll_batch_limit": {
+    "description": "单次最多拉取条数",
+    "type": "int",
+    "default": 50,
+    "hint": "积压消息多时会自动连拉多轮，直到追平。"
+  },
+  "poll_exclude_sources": {
+    "description": "不转发到群里的消息来源",
+    "type": "string",
+    "default": "qq",
+    "hint": "逗号分隔，可选 mc / qq / console / system。默认排除 qq，避免群里发的消息又被推回群里造成刷屏。"
+  },
+  "skip_backlog_on_first_poll": {
+    "description": "插件启动时不回放历史消息",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后首次拉取只记录游标位置，把服务器里已有的旧消息跳过，避免一启动就刷屏。"
+  },
+  "send_interval_ms": {
+    "description": "消息发送间隔（毫秒）",
+    "type": "int",
+    "default": 300,
+    "hint": "每条消息之间等待的时间，防止触发 QQ 风控。"
+  },
+  "platform_id": {
+    "description": "平台适配器 ID",
+    "type": "string",
+    "default": "auto",
+    "hint": "填 auto 会自动探测（推荐）。若手动指定，必须与 AstrBot 里平台实例的 ID 完全一致——注意它默认常常是 default 而不是 aiocqhttp；写错会报「cannot find platform for session」而发不出消息。"
+  },
+  "bridges": {
+    "description": "【必填】聊天池 ↔ QQ 群 绑定关系",
+    "type": "text",
+    "editor_mode": true,
+    "default": "# 每行一条：聊天池名 = 群号1, 群号2\n# 聊天池名必须与 Paper 插件 config.yml 的 pools 段一致\nglobal = 123456789\ntech = 987654321",
+    "hint": "每行格式：池名 = 群号（多个群用逗号分隔）。也支持直接粘贴 JSON：[{\"pool\":\"global\",\"groups\":[\"123456\"]}]。"
+  },
+  "enable_group_to_mc": {
+    "description": "允许群内命令往服务器发消息",
+    "type": "bool",
+    "default": true
+  },
+  "command_prefix": {
+    "description": "群内命令前缀",
+    "type": "string",
+    "default": "#mc",
+    "hint": "默认 #mc，同时也接受 /mc。例如：#mc 大家好。"
+  },
+  "group_whitelist": {
+    "description": "群白名单",
+    "type": "list",
+    "default": [],
+    "items": {
+      "type": "string"
+    },
+    "hint": "留空表示所有群都能用；填了就只响应这些群。"
+  },
+  "admin_qq_ids": {
+    "description": "管理员 QQ 号",
+    "type": "list",
+    "default": [],
+    "items": {
+      "type": "string"
+    },
+    "hint": "这些 QQ 可以使用 #mc bind / #mc unbind 修改绑定关系；群管理员身份也自动认可。"
+  },
+  "default_pool": {
+    "description": "默认聊天池",
+    "type": "string",
+    "default": "global",
+    "hint": "群没有绑定任何池时，#mc <文本> 会发到这个池。"
+  },
+  "max_message_length": {
+    "description": "发往服务器的单条消息长度上限",
+    "type": "int",
+    "default": 300,
+    "hint": "超过会被截断，建议与服务器端的 chat.max-message-length 保持一致。"
+  },
+  "mc_to_qq_format": {
+    "description": "游戏内消息 → QQ 群的显示格式",
+    "type": "string",
+    "default": "[MC] {sender}: {content}",
+    "hint": "可用占位符：{pool} {sender} {sender_id} {content} {id} {source} {time}"
+  },
+  "qq_sender_format": {
+    "description": "QQ 成员名 → 游戏内显示的名字",
+    "type": "string",
+    "default": "{nickname}",
+    "hint": "可用占位符：{nickname} {qq} {group_id} {pool}。例如填「{nickname}(QQ)」会让游戏内看到 xxx(QQ)。"
+  },
+  "reply_to_group": {
+    "description": "在群里回执命令结果",
+    "type": "bool",
+    "default": true,
+    "hint": "关闭后 #mc 命令只有发消息有效，不再回复「已发送」之类的提示。"
+  },
+  "http_timeout_seconds": {
+    "description": "HTTP 超时（秒）",
+    "type": "int",
+    "default": 8
+  }
+}

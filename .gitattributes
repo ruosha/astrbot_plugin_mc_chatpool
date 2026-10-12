@@ -1,0 +1,13 @@
+# Normalize line endings so the repo works the same on Windows and Linux.
+* text=auto eol=lf
+
+# Windows batch files must keep CRLF: cmd.exe is unhappy with LF-only .bat files
+# in some edge cases (labels, multi-line blocks).
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Binary assets - never touch these.
+*.png binary
+*.jpg binary
+*.gif binary
+*.zip binary

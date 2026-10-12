@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# pytest / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# AstrBot runtime data (never commit state)
+data/
+state.json
+
+# local-only deploy helper (contains an absolute path of the author's machine)
+deploy.bat
+
+# editors
+.idea/
+.vscode/
+.DS_Store
