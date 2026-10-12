@@ -1,9 +1,9 @@
 name: "astrbot_plugin_mc_chatpool"
 display_name: "MC 聊天池桥接 (Minecraft ChatPool Bridge)"
-author: "DSH"
+author: "ruosha"
 version: "1.0.0"
 desc: "把 Minecraft(Paper) 服务器的聊天池与 QQ 群聊打通：定时拉取游戏内消息发到群，群内 #mc 命令把消息送回服务器广播给玩家。"
-repo: ""
+repo: "https://github.com/ruosha/astrbot_plugin_mc_chatpool"
 astrbot_version: ">=4.16.0"
 support_platforms:
   - aiocqhttp

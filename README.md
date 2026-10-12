@@ -30,7 +30,7 @@
 
 ```bash
 cd <AstrBot>/data/plugins
-git clone https://github.com/<你的用户名>/astrbot_plugin_mc_chatpool.git
+git clone https://github.com/ruosha/astrbot_plugin_mc_chatpool.git
 ```
 
 然后在 WebUI 的「插件管理」里重载，或重启 AstrBot。
@@ -167,12 +167,12 @@ python tests/test_offline.py
 
 ---
 
-## 8. 发布到 GitHub 之后
+## 8. 更新
 
-`metadata.yaml` 里的 `repo` 字段可以填上仓库地址，AstrBot 的插件管理界面会用它检查更新：
+`metadata.yaml` 里的 `repo` 字段已填上仓库地址，AstrBot 的插件管理界面会用它检查更新：
 
 ```yaml
-repo: "https://github.com/<你的用户名>/astrbot_plugin_mc_chatpool"
+repo: "https://github.com/ruosha/astrbot_plugin_mc_chatpool"
 ```
 
 ---

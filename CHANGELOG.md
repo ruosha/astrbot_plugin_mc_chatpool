@@ -25,4 +25,4 @@
   不需要 AstrBot 运行时即可跑。
 - **CI**：GitHub Actions 在 Python 3.10 / 3.11 / 3.12 上跑语法检查与离线测试。
 
-[1.0.0]: https://github.com/<username>/astrbot_plugin_mc_chatpool/releases/tag/v1.0.0
+[1.0.0]: https://github.com/ruosha/astrbot_plugin_mc_chatpool/releases/tag/v1.0.0
