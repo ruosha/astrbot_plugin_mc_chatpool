@@ -86,7 +86,7 @@ HELP_TEXT = (
 
 @register(
     PLUGIN_NAME,
-    "DSH",
+    "ruosha",
     "Minecraft 聊天池桥接：定时把服务器聊天池里的消息发到 QQ 群，群内 #mc 命令把消息送回服务器。",
     "1.0.0",
 )
