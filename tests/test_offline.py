@@ -52,7 +52,86 @@ class FakeMessageChain:
 
     @property
     def text(self) -> str:
-        return "".join(item[1] for item in self.components if item[0] == "text")
+        """纯文本部分：Nodes 之类的非文本组件不贡献文本（与 AstrBot 行为一致）。"""
+        parts = []
+        for item in self.components:
+            if isinstance(item, tuple):
+                if item[0] == "text":
+                    parts.append(item[1])
+            else:
+                parts.append(getattr(item, "text", ""))
+        return "".join(parts)
+
+
+class FakeNode:
+    """Node 组件的替身：只保留合并转发用得到的字段。"""
+
+    def __init__(self, content=None, **kwargs):
+        self.content = list(content or [])
+        self.name = kwargs.get("name", "")
+        self.uin = str(kwargs.get("uin", "0"))
+
+    def text(self) -> str:
+        return "".join(getattr(item, "text", "") for item in self.content)
+
+
+class FakeNodes:
+    """Nodes 组件的替身，to_dict() 的形状与 AstrBot 的保持一致。"""
+
+    def __init__(self, nodes=None, **kwargs):
+        self.nodes = list(nodes or [])
+
+    async def to_dict(self) -> dict:
+        return {
+            "messages": [
+                {
+                    "type": "node",
+                    "data": {
+                        "user_id": node.uin,
+                        "nickname": node.name,
+                        "content": [
+                            {"type": "text", "data": {"text": getattr(item, "text", "")}}
+                            for item in node.content
+                        ],
+                    },
+                }
+                for node in self.nodes
+            ]
+        }
+
+
+class FakeBot:
+    """aiocqhttp bot 的替身：记录 call_action 的调用，可选择抛异常。"""
+
+    def __init__(self, fail: bool = False):
+        self.calls: list[tuple[str, dict]] = []
+        self.fail = fail
+
+    async def call_action(self, action: str, **payload):
+        self.calls.append((action, payload))
+        if self.fail:
+            raise RuntimeError("napcat 拒绝了这次 call_action")
+        return {"message_id": 1}
+
+
+def cards_in(chains) -> list:
+    """从若干 MessageChain 里挑出合并转发组件。"""
+    cards = []
+    for chain in chains:
+        for component in chain.components:
+            if isinstance(component, FakeNodes):
+                cards.append(component)
+    return cards
+
+
+def merged_cards(context) -> list:
+    """取出 context 里以 Nodes 组件发出的合并转发卡片。"""
+    return cards_in([chain for _, chain in getattr(context, "chains", [])])
+
+
+def sent_cards(event) -> list:
+    """取出 event.send() 发出的合并转发卡片。"""
+    return cards_in(getattr(event, "sent_chains", []))
 
 
 class FakeFilter:
@@ -133,6 +212,8 @@ def install_stubs() -> None:
 
     components_mod = types.ModuleType("astrbot.api.message_components")
     components_mod.Plain = type("Plain", (), {"__init__": lambda self, text="": setattr(self, "text", text)})
+    components_mod.Node = FakeNode
+    components_mod.Nodes = FakeNodes
 
     core = types.ModuleType("astrbot.core")
     core_msg = types.ModuleType("astrbot.core.message")
@@ -140,6 +221,8 @@ def install_stubs() -> None:
     core_msg_res.MessageChain = FakeMessageChain
     core_comp = types.ModuleType("astrbot.core.message.components")
     core_comp.Plain = components_mod.Plain
+    core_comp.Node = FakeNode
+    core_comp.Nodes = FakeNodes
     core_star = types.ModuleType("astrbot.core.star")
     core_star_tools = types.ModuleType("astrbot.core.star.star_tools")
     core_star_tools.StarTools = FakeStarTools
@@ -183,6 +266,7 @@ class FakeEvent:
         self.unified_msg_origin = f"aiocqhttp:GroupMessage:{group_id}"
         self.stopped = False
         self.sent: list[str] = []
+        self.sent_chains: list = []    # event.send() 发出的完整 chain
         self._admin = False
 
     def get_group_id(self):
@@ -205,15 +289,18 @@ class FakeEvent:
 
     async def send(self, chain):
         self.sent.append(chain.text)
+        self.sent_chains.append(chain)
         return True
 
 
 class FakeContext:
     def __init__(self):
         self.messages: list[tuple[str, str]] = []
+        self.chains: list = []          # 完整 chain，便于检查合并转发组件
 
     async def send_message(self, umo, chain):
         self.messages.append((umo, chain.text))
+        self.chains.append((umo, chain))
         return True
 
 
@@ -493,6 +580,263 @@ def main() -> int:
         asyncio.run(plugin._poll_pool("global", ["123456789"]))
     check("重试到上限后放弃并推进游标", plugin._state["cursors"]["global"] == 11, str(plugin._state["cursors"]))
     check("放弃后清掉失败计数", 11 not in plugin._failed_ids, str(plugin._failed_ids))
+
+    # ------------------------------------------------------- 合并转发 / 全量读取
+
+    class FakePlatformBot:
+        def __init__(self, pid: str, name: str, bot=None):
+            self._meta = FakeMeta(pid, name)
+            self.bot = bot
+
+        def meta(self):
+            return self._meta
+
+    def reset_runtime(bot=None, platform_id: str = "default") -> None:
+        """把插件恢复到「平台已注册、游标为空」的干净状态，便于各用例独立观察。"""
+        plugin._platform_id_cache = None
+        plugin._failed_ids = {}
+        plugin._deferred_warned = {}
+        plugin._state["cursors"] = {}
+        plugin.config["skip_backlog_on_first_poll"] = False  # 让首次轮询直接从 since=0 开始
+        plugin.context = FakeContext()
+        plugin.context.platform_manager = FakePlatformManager([FakePlatformBot(platform_id, "aiocqhttp", bot)])
+        plugin._config_bridges = plugin._parse_bridges()
+
+    def make_messages(count: int) -> list[dict]:
+        return [
+            {"id": i, "source": "mc", "sender": f"S{i}", "sender_id": f"uuid-{i}", "content": f"消息{i}"}
+            for i in range(1, count + 1)
+        ]
+
+    def paged_stub(messages: list[dict]):
+        """一次给完的增量接口替身。"""
+
+        async def stub(path, params=None):
+            newest = messages[-1]["id"]
+            if params.get("since") == 0:
+                return {"ok": True, "cursor": newest, "pool_cursor": newest, "has_more": False, "messages": messages}
+            return {"ok": True, "cursor": newest, "pool_cursor": newest, "has_more": False, "messages": []}
+
+        return stub
+
+    plugin.config["bridges"] = "global = 123456789"
+    plugin.config.pop("merge_forward_threshold", None)
+    plugin.config.pop("read_all_history", None)
+
+    # 21. 不足阈值：维持逐条发送（默认行为不变）
+    reset_runtime()
+    plugin._api_get = paged_stub(make_messages(5))
+    asyncio.run(plugin._poll_pool("global", ["123456789"]))
+    check(
+        "5 条（< 阈值 6）仍然逐条发送",
+        len(plugin.context.messages) == 5
+        and not merged_cards(plugin.context)
+        and plugin._state["cursors"]["global"] == 5,
+        str(plugin.context.messages),
+    )
+
+    # 22. 达到阈值：一次合并转发，游标一次推进到最新
+    reset_runtime()
+    plugin._api_get = paged_stub(make_messages(6))
+    asyncio.run(plugin._poll_pool("global", ["123456789"]))
+    cards = merged_cards(plugin.context)
+    check(
+        "6 条（>= 阈值 6）改用一次合并转发",
+        len(cards) == 1 and len(cards[0].nodes) == 6 and plugin._state["cursors"]["global"] == 6,
+        f"cards={[len(c.nodes) for c in cards]}",
+    )
+
+    # 23. node 的显示名与内容（与逐条发送的渲染结果一致）
+    node = plugin._to_node("global", {"id": 7, "sender": "Steve", "sender_id": "uuid-x", "content": "你好"})
+    check(
+        "node 显示名用 MC 发送者名、内容用 mc_to_qq_format 渲染结果",
+        node.name == "Steve" and node.text() == "[MC] Steve: 你好",
+        node.text(),
+    )
+    check("node 的 user_id 对 UUID 退化为 0", node.uin == "0", node.uin)
+    node = plugin._to_node("global", {"id": 8, "sender": "群友", "sender_id": "10001", "content": "hi"})
+    check("node 的 user_id 对纯数字（QQ）保留", node.uin == "10001", node.uin)
+
+    # 24. 卡片标题与拆分
+    plugin.config["merge_forward_max_nodes"] = 2
+    bot = FakeBot()
+    nodes = [plugin._to_node("global", message) for message in make_messages(5)]
+    ok = asyncio.run(plugin._send_forward("default", "aiocqhttp:GroupMessage:123", "123", True, nodes, bot, None))
+    check(
+        "超过 merge_forward_max_nodes 拆成多张卡片",
+        ok is True and [len(call[1]["messages"]) for call in bot.calls] == [2, 2, 1],
+        str([len(call[1]["messages"]) for call in bot.calls]),
+    )
+    check(
+        "群聊走 send_group_forward_msg 且带 group_id",
+        all(call[0] == "send_group_forward_msg" and call[1].get("group_id") == "123" for call in bot.calls),
+        str(bot.calls[0][0]),
+    )
+    check(
+        "卡片带上配置的标题（summary）",
+        all(call[1].get("summary") == "MC 聊天记录" for call in bot.calls),
+        str(bot.calls[0][1].get("summary")),
+    )
+    check(
+        "payload 里的昵称与内容来自 node",
+        bot.calls[0][1]["messages"][0]["data"]["nickname"] == "S1"
+        and bot.calls[0][1]["messages"][0]["data"]["content"][0]["data"]["text"] == "[MC] S1: 消息1",
+        str(bot.calls[0][1]["messages"][0]),
+    )
+
+    bot = FakeBot()
+    asyncio.run(plugin._send_forward("default", "aiocqhttp:FriendMessage:9", "9", False, nodes[:1], bot, None))
+    check(
+        "私聊走 send_private_forward_msg 且带 user_id",
+        bot.calls[0][0] == "send_private_forward_msg" and bot.calls[0][1].get("user_id") == "9",
+        str(bot.calls[0]),
+    )
+
+    plugin.config["merge_forward_title"] = ""
+    bot = FakeBot()
+    asyncio.run(plugin._send_forward("default", "aiocqhttp:GroupMessage:123", "123", True, nodes[:1], bot, None))
+    check("标题留空时不传 summary", "summary" not in bot.calls[0][1], str(list(bot.calls[0][1].keys())))
+    plugin.config["merge_forward_title"] = "MC 聊天记录"
+    plugin.config["merge_forward_max_nodes"] = 100
+
+    # 25. 合并转发失败 -> 逐条兜底（不能丢消息）
+    reset_runtime(bot=FakeBot(fail=True))
+    plugin._api_get = paged_stub(make_messages(6))
+    asyncio.run(plugin._poll_pool("global", ["123456789"]))
+    check(
+        "合并转发失败后退回逐条发送",
+        len(plugin.context.messages) == 6 and not merged_cards(plugin.context),
+        str(len(plugin.context.messages)),
+    )
+    check("兜底发送成功后游标照样推进", plugin._state["cursors"]["global"] == 6, str(plugin._state["cursors"]))
+
+    # 26. 全量分页累积
+    limits: list = []
+
+    async def history_stub(path, params=None):
+        limits.append(params.get("limit"))
+        since = params.get("since")
+        if since == 0:
+            return {"ok": True, "cursor": 3, "pool_cursor": 7, "has_more": True, "messages": make_messages(3)}
+        if since == 3:
+            return {
+                "ok": True,
+                "cursor": 6,
+                "pool_cursor": 7,
+                "has_more": True,
+                "messages": [{"id": i, "sender": "A", "content": f"c{i}"} for i in (4, 5, 6)],
+            }
+        return {
+            "ok": True,
+            "cursor": 7,
+            "pool_cursor": 7,
+            "has_more": False,
+            "messages": [{"id": 7, "sender": "A", "content": "c7"}],
+        }
+
+    plugin._api_get = history_stub
+    plugin.config["history_page_size"] = 3
+    collected, pool_cursor = asyncio.run(plugin._fetch_history("global", 0, plugin._history_page_size()))
+    check(
+        "分页累积读完整段历史",
+        [m["id"] for m in collected] == [1, 2, 3, 4, 5, 6, 7] and pool_cursor == 7 and len(limits) == 3,
+        f"ids={[m['id'] for m in collected]} pages={len(limits)}",
+    )
+    check("分页每页用 history_page_size", all(limit == 3 for limit in limits), str(limits))
+
+    limits.clear()
+    collected, _ = asyncio.run(plugin._fetch_history("global", 4, 3))
+    check(
+        "history_max_messages 限制累积条数",
+        [m["id"] for m in collected] == [1, 2, 3, 4],
+        str([m["id"] for m in collected]),
+    )
+    plugin.config["history_page_size"] = 200
+
+    # 27. read_all_history：首次同步回放全部历史
+    reset_runtime()
+    plugin.config["read_all_history"] = True
+    plugin.config["merge_forward_max_nodes"] = 2
+    plugin.config["merge_forward_threshold"] = 6
+    since_seen: list = []
+
+    async def full_stub(path, params=None):
+        since_seen.append(params.get("since"))
+        newest = 6
+        if params.get("since") == 0:
+            return {"ok": True, "cursor": newest, "pool_cursor": newest, "has_more": False, "messages": make_messages(6)}
+        return {"ok": True, "cursor": newest, "pool_cursor": newest, "has_more": False, "messages": []}
+
+    plugin._api_get = full_stub
+    changed = asyncio.run(plugin._poll_pool("global", ["123456789"]))
+    check("read_all_history 首次同步从 since=0 开始", changed and since_seen and since_seen[0] == 0, str(since_seen))
+    check("全量同步结束后游标推进到最新", plugin._state["cursors"]["global"] == 6, str(plugin._state["cursors"]))
+    cards = merged_cards(plugin.context)
+    check(
+        "全量同步按 merge_forward_max_nodes 拆成合并转发卡片",
+        [len(card.nodes) for card in cards] == [2, 2, 2],
+        str([len(card.nodes) for card in cards]),
+    )
+    plugin.config["read_all_history"] = False
+
+    # 28. #mc all 参数解析与导出
+    plugin.config["merge_forward_max_nodes"] = 100
+    check("all 缺省用本群绑定的池、条数为全部", plugin._parse_all_args("123456789", "") == ("global", 0))
+    check("all 只给池名", plugin._parse_all_args("123456789", "tech") == ("tech", 0))
+    check("all 只给条数", plugin._parse_all_args("123456789", "30") == ("global", 30))
+    check("all 池名 + 条数", plugin._parse_all_args("123456789", "tech 30") == ("tech", 30))
+    check("all 条数非法时按全部处理", plugin._parse_all_args("123456789", "tech abc") == ("tech", 0))
+
+    export_calls: list = []
+
+    async def export_stub(path, params=None):
+        export_calls.append(dict(params or {}))
+        all_messages = make_messages(6)
+        if "since" not in params:  # tail 模式：服务端直接给最新的 N 条
+            return {
+                "ok": True,
+                "cursor": 6,
+                "pool_cursor": 6,
+                "has_more": False,
+                "messages": all_messages[-int(params.get("limit", 5)):],
+            }
+        return {
+            "ok": True,
+            "cursor": 6,
+            "pool_cursor": 6,
+            "has_more": False,
+            "messages": all_messages if params["since"] == 0 else [],
+        }
+
+    reset_runtime()
+    plugin._api_get = export_stub
+    event = FakeEvent("#mc all 3")
+    asyncio.run(plugin._handle_group_message(event))
+    cards = sent_cards(event)
+    check(
+        "#mc all 3 用 tail 模式取最新 3 条并合并转发",
+        len(cards) == 1 and len(cards[0].nodes) == 3 and "since" not in export_calls[0],
+        f"cards={[len(card.nodes) for card in cards]} calls={export_calls}",
+    )
+    check(
+        "#mc all 导出的是最新那几条",
+        [n.text() for n in cards[0].nodes][-1] == "[MC] S6: 消息6",
+        str([n.text() for n in cards[0].nodes]),
+    )
+    check("all 会回复导出结果", any("已导出" in message for message in event.sent), str(event.sent))
+
+    reset_runtime()
+    export_calls.clear()
+    plugin._api_get = export_stub
+    event = FakeEvent("#mc all")
+    asyncio.run(plugin._handle_group_message(event))
+    cards = sent_cards(event)
+    check(
+        "#mc all 不带条数时导出全部（分页 + 合并转发）",
+        len(cards) == 1 and len(cards[0].nodes) == 6 and export_calls[0].get("since") == 0,
+        f"cards={[len(card.nodes) for card in cards]} calls={export_calls}",
+    )
+    plugin.config["skip_backlog_on_first_poll"] = True
 
     print()
     print(f"全部通过：{len(PASSED)} 项")

@@ -54,8 +54,14 @@ git clone https://github.com/ruosha/astrbot_plugin_mc_chatpool.git
 | `poll_interval_seconds` | `5` | 拉取间隔（秒） |
 | `poll_batch_limit` | `50` | 单次最多拉多少条；积压时自动连拉多轮 |
 | `poll_exclude_sources` | `qq` | 不转发到群的来源，**别删**，否则群消息会被拉回来刷屏 |
-| `skip_backlog_on_first_poll` | `true` | 首次运行只记游标，不回放服务器里的历史消息 |
-| `send_interval_ms` | `300` | 消息之间的发送间隔，防 QQ 风控 |
+| `skip_backlog_on_first_poll` | `true` | 首次运行只记游标，不回放服务器里的历史消息（`read_all_history` 打开时本项不生效） |
+| `read_all_history` | `false` | 首次同步某个池时**读取全部历史**并发到群里，完成后自动转回增量 |
+| `history_page_size` | `200` | 全量同步时每页拉取条数（接口上限 200） |
+| `history_max_messages` | `2000` | 单次全量同步最多处理多少条，`0` = 不限制 |
+| `send_interval_ms` | `300` | 消息之间的发送间隔，防 QQ 风控（多张转发卡片之间同样间隔） |
+| `merge_forward_threshold` | `6` | 一轮要发的消息 ≥ 这个数就改用**合并转发**，少于它仍然逐条发 |
+| `merge_forward_max_nodes` | `100` | 单张合并转发卡片最多几条，超出拆成多张依次发 |
+| `merge_forward_title` | `MC 聊天记录` | 合并转发卡片的外显标题，留空则不设置（用 QQ 默认样式） |
 | `platform_id` | `auto` | 平台适配器 ID。**建议保持 auto 自动探测**：AstrBot 里平台实例的 ID 是用户自己起的名字，写死成 `aiocqhttp` 会报 `cannot find platform for session` 而发不出消息 |
 | `bridges` | 示例值 | **必填**：`聊天池 = 群号1, 群号2`，每行一条 |
 | `enable_group_to_mc` | `true` | 允许群内命令往服务器发消息 |
@@ -90,7 +96,8 @@ tech = 555555
 | `#mc send <池> <文本>` | 发到指定聊天池；只给池名不给文本会提示用法 |
 | `#mc status` | 服务器在线人数、聊天池概况、接口地址 |
 | `#mc pools` | 列出所有聊天池与绑定情况 |
-| `#mc history [池] [条数]` | 查看最近的游戏内消息（默认 5 条，最多 20 条） |
+| `#mc history [池] [条数]` | 查看最近的游戏内消息（默认 5 条，最多 20 条，纯文本） |
+| `#mc all [池] [条数]` | 把该池历史以**合并转发**导出到当前会话（缺省 = 本群绑定的池 + 全部条数） |
 | `#mc bind <池>` | 把本群绑定到某个池（管理员） |
 | `#mc unbind [池]` | 解除绑定（管理员） |
 | `#mc help` | 帮助（单独发 `#mc`、`#mc 帮助`、`#mc ?` 也一样） |
@@ -149,8 +156,27 @@ tech = 555555
   避免丢消息；连续失败到上限就放弃这一条并继续推进游标（宁可丢一条也不卡死）。
   平台尚未连上（`ApiNotAvailable` 等）属于暂时不可用，挂起等待、**不消耗**重试次数，连上后自动补发。
 * **首次同步**：默认只记录游标、不回放历史，避免插件一启动就把服务器里攒了半天的消息全刷进群。
+  打开 `read_all_history` 后改为**首次把该池保留的历史全部转发一遍**：从最早一条开始按
+  `history_page_size` 分页拉取，总量受 `history_max_messages` 限制，完成后游标推进到最新，
+  之后自动恢复增量（中途失败不会跳到最新，剩下的按增量补发，不会丢）。
+* **合并转发**：一轮要发的消息达到 `merge_forward_threshold` 时，不再逐条刷屏，而是打包成
+  QQ 的「合并转发」卡片。卡片里每条记录的**显示名是 MC 发送者名**，内容与逐条发送完全一致
+  （同一个 `mc_to_qq_format` 渲染结果）；超过 `merge_forward_max_nodes` 会拆成多张卡片依次发。
+  **合并转发任何一步失败都会自动退化成逐条发送**，并记一条 warning，确保消息不丢。
 * **一键安装友好**：命令处理走 `event_message_type(GROUP_MESSAGE)` 过滤器而不是 `@filter.command`，
   不依赖 AstrBot 的唤醒前缀配置。
+
+### 合并转发是怎么发出去的（排查用）
+
+* 群聊调 `send_group_forward_msg`，私聊调 `send_private_forward_msg`——这也是 AstrBot 的
+  aiocqhttp 适配器内部的分流方式。
+* 卡片标题（`merge_forward_title`）在协议里是 action 的**顶层参数** `summary`，
+  而 AstrBot 的 `Node`/`Nodes` 组件只携带 `nickname`/`content`，两边对不上。
+  所以插件在能拿到 bot 实例时自己 `call_action`（复用 `Nodes.to_dict()` 生成 payload，
+  与框架产物完全一致），把 `summary` 一起带上；拿不到 bot 时退回原生 `Nodes` 组件链，
+  由框架自己路由，此时**标题不生效**（日志会写明用的是哪条路径）。
+* node 的 `user_id` 只在发送者 id 是纯数字（QQ 号）时才带上；MC 玩家是 UUID，
+  一律用 `0`，避免协议端构造转发报文时出错——实际显示的是昵称，不受影响。
 
 ---
 
@@ -162,8 +188,11 @@ tech = 555555
 python tests/test_offline.py
 ```
 
-覆盖 38 项断言：桥接配置解析（行格式 / JSON）、占位符渲染与防二次替换、群命令分发与权限、
-消息截断、轮询游标与 `has_more` 连拉、平台 ID 自动探测、投递失败不推进游标与重试上限等。
+覆盖 66 项断言：桥接配置解析（行格式 / JSON）、占位符渲染与防二次替换、群命令分发与权限、
+消息截断、轮询游标与 `has_more` 连拉、平台 ID 自动探测、投递失败不推进游标与重试上限、
+合并转发阈值判断与 `max_nodes` 拆分、卡片标题（`summary`）字段、node 构造、
+合并转发失败的逐条兜底、全量分页累积与 `history_max_messages` 截断、
+`read_all_history` 首次回放、`#mc all` 参数解析与导出。
 
 ---
 

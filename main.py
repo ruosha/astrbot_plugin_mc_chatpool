@@ -23,6 +23,23 @@ Paper 侧安装 McQqChatPool 插件，它把「聊天池」以自增 ID 的形�
 都能看到完整上下文）。如果拉取时不排除它，群里的消息会被拉回来再发一遍，
 形成自我复制的刷屏循环。因此 `poll_exclude_sources` 默认为 `qq`。
 
+批量与合并转发
+==============
+
+一轮拉到的消息如果够多（>= ``merge_forward_threshold``），就不再逐条刷屏，而是打包成
+QQ 的「合并转发」卡片（NapCat 的 ``send_group_forward_msg`` / ``send_private_forward_msg``）。
+卡片里每个 node 的显示名是 MC 发送者名，内容与逐条发送时完全一致（同一个
+``mc_to_qq_format`` 渲染结果）；超过 ``merge_forward_max_nodes`` 会自动拆成多张卡片依次发。
+合并转发失败时退化成逐条发送，确保消息不丢。
+
+全量读取历史
+============
+
+``read_all_history`` 打开后，某个池**首次**同步不再跳过历史，而是从最早的保留消息开始
+分页拉取（``history_page_size`` 一页）并转发，总量受 ``history_max_messages`` 限制，
+完成后把游标推进到该池最新位置，之后恢复增量。群里也可以用 ``#mc all [池] [条数]``
+随时把历史以合并转发导出到当前会话。
+
 落盘
 ====
 
@@ -54,6 +71,15 @@ try:
 except ImportError:  # pragma: no cover - 旧版本回退
     from astrbot.core.message.components import Plain
 
+try:  # 合并转发组件（Node/Nodes）：4.x 起放在 message_components 里
+    from astrbot.api.message_components import Node, Nodes
+except ImportError:  # pragma: no cover - 旧版本回退
+    try:
+        from astrbot.core.message.components import Node, Nodes  # type: ignore[no-redef]
+    except ImportError:  # 实在没有就退化成逐条发送
+        Node = None  # type: ignore[assignment,misc]
+        Nodes = None  # type: ignore[assignment,misc]
+
 try:
     from astrbot.api.star import StarTools
 except ImportError:  # pragma: no cover - 旧版本回退
@@ -71,6 +97,16 @@ MAX_DELIVERY_RETRIES = 10
 #: ApiNotAvailable 是 AstrBot aiocqhttp 适配器在反向 WS 未就绪时抛出的。
 DEFERRED_EXCEPTIONS = {"ApiNotAvailable", "ConnectionError", "ClientConnectionError"}
 
+#: 合并转发要调用的 OneBot 11 action（NapCat 支持）。群聊与私聊是两个不同的 action，
+#: AstrBot 的 aiocqhttp 适配器内部也是这么分流的。
+FORWARD_ACTIONS = {
+    True: "send_group_forward_msg",
+    False: "send_private_forward_msg",
+}
+
+#: mc_to_qq_format 的默认值（逐条发送与合并转发共用，保证观感一致）。
+DEFAULT_FORMAT = "[MC] {sender}: {content}"
+
 HELP_TEXT = (
     "🕹 MC 聊天池命令\n"
     "#mc <文本>            — 发到本群绑定的聊天池\n"
@@ -78,6 +114,7 @@ HELP_TEXT = (
     "#mc status            — 查看服务器与聊天池状态\n"
     "#mc pools             — 列出所有聊天池\n"
     "#mc history [池] [条数] — 查看最近几条游戏内消息\n"
+    "#mc all [池] [条数]    — 把该池历史以合并转发导出到本会话\n"
     "#mc bind <池>          — 把本群绑定到某个聊天池（管理员）\n"
     "#mc unbind [池]        — 解除绑定（管理员）\n"
     "#mc help              — 显示这条帮助"
@@ -178,6 +215,32 @@ class McChatPoolBridge(Star):
             value = default
         return max(low, min(high, value))
 
+    # ---- 「全量读取历史」与「合并转发」的配置读取 ----
+
+    def _read_all_history(self) -> bool:
+        """首次同步是否把池子里保留的历史全部读出来（而不是只记游标跳过）。"""
+        return self._as_bool("read_all_history", False)
+
+    def _history_page_size(self) -> int:
+        """全量同步时每页拉多少条（服务端接口的 limit 上限就是 200）。"""
+        return self._as_int("history_page_size", 200, 1, 200)
+
+    def _history_max_messages(self) -> int:
+        """单次全量同步最多处理多少条；0 = 不限制。"""
+        return self._as_int("history_max_messages", 2000, 0, 1_000_000)
+
+    def _merge_threshold(self) -> int:
+        """一轮要发的消息达到这个数量，就改用合并转发。"""
+        return self._as_int("merge_forward_threshold", 6, 1, 100_000)
+
+    def _merge_max_nodes(self) -> int:
+        """单张合并转发卡片最多放多少条消息，超出拆成多张。"""
+        return self._as_int("merge_forward_max_nodes", 100, 1, 1000)
+
+    def _merge_title(self) -> str:
+        """合并转发卡片的外显标题（NapCat 的 summary 字段）。"""
+        return self._str("merge_forward_title", "MC 聊天记录")
+
     def _base_url(self) -> str:
         url = self._str("mc_base_url", "http://127.0.0.1:8123")
         return url.rstrip("/")
@@ -274,6 +337,44 @@ class McChatPoolBridge(Star):
         except Exception as exc:  # noqa: BLE001 - 状态查不到就不拦
             logger.debug(f"[mc_chatpool] 读取平台状态失败：{exc}")
         return None
+
+    def _bot_for(self, platform_id: str, event: AstrMessageEvent | None = None):
+        """取 aiocqhttp 的 bot 实例，拿不到就返回 None。
+
+        为什么要单独取 bot：合并转发卡片的外显标题（NapCat 的 ``summary``）是 action 的
+        **顶层参数**，而 AstrBot 的 ``Node``/``Nodes`` 组件只带 nickname/content，不携带它。
+        想让标题生效就得自己 ``call_action``，而 call_action 需要 bot 实例
+        （命令路径用 ``event.bot``，轮询路径用平台适配器上的 ``.bot``）。
+        取不到时退回原生组件链，让框架自己路由（此时标题不生效）。
+        """
+        if event is not None:
+            bot = getattr(event, "bot", None)
+            if bot is not None and hasattr(bot, "call_action"):
+                return bot
+        try:
+            inst = None
+            getter = getattr(self.context, "get_platform_inst", None)
+            if callable(getter):
+                inst = getter(platform_id)
+            if inst is None:
+                manager = getattr(self.context, "platform_manager", None)
+                insts = list(manager.get_insts()) if manager is not None and hasattr(manager, "get_insts") else []
+                for candidate in insts:
+                    meta = candidate.meta()
+                    pid = str(getattr(meta, "id", "") or "")
+                    name = str(getattr(meta, "name", "") or "")
+                    if platform_id in (pid, name):
+                        inst = candidate
+                        break
+            if inst is None:
+                return None
+            bot = getattr(inst, "bot", None)
+            if bot is None and hasattr(inst, "get_client"):
+                bot = inst.get_client()
+            return bot if bot is not None and hasattr(bot, "call_action") else None
+        except Exception as exc:  # noqa: BLE001 - 取不到就当作没有
+            logger.debug(f"[mc_chatpool] 获取 bot 实例失败：{exc}")
+            return None
 
     # =============================================================== 数据落盘
 
@@ -454,6 +555,9 @@ class McChatPoolBridge(Star):
 
         cursor = self._state["cursors"].get(pool)
         if cursor is None:
+            if self._read_all_history():
+                # 全量读取：不回放？要回放——把服务器保留的历史全部读出来发一遍。
+                return await self._sync_full_history(pool, groups)
             if not self._as_bool("skip_backlog_on_first_poll", True):
                 cursor = 0
             else:
@@ -477,46 +581,12 @@ class McChatPoolBridge(Star):
                 return changed
 
             messages = data.get("messages") or []
+            if not messages:
+                break
+
             # 只有确认送达的消息才允许把游标推过去：没送达的留在原地，
             # 下一轮会重试，避免「机器人刚启动、平台还没注册好」这类竞态把消息丢掉。
-            delivered_upto = cursor
-            retry_later = False
-            for message in messages:
-                message_id = int(message.get("id") or 0)
-                outcome = await self._deliver(pool, groups, message)
-                if outcome is True:
-                    self._failed_ids.pop(message_id, None)
-                    self._deferred_warned[pool] = False
-                    delivered_upto = message_id
-                    continue
-
-                if outcome is None:
-                    # 平台还没连上：不算失败、不消耗重试次数，游标停住等下一轮。
-                    if not self._deferred_warned.get(pool):
-                        self._deferred_warned[pool] = True
-                        logger.info(
-                            f"[mc_chatpool] 平台尚未连接，暂停转发聊天池 {pool}（游标停在 {delivered_upto}），"
-                            "连上后会自动补发这几条消息。"
-                        )
-                    retry_later = True
-                    break
-
-                failures = self._failed_ids.get(message_id, 0) + 1
-                self._failed_ids[message_id] = failures
-                if failures < MAX_DELIVERY_RETRIES:
-                    logger.warning(
-                        f"[mc_chatpool] 消息 #{message_id} 未送达（第 {failures}/{MAX_DELIVERY_RETRIES} 次），"
-                        f"游标停在 {delivered_upto}，下一轮重试。"
-                    )
-                    retry_later = True
-                    break
-
-                logger.error(
-                    f"[mc_chatpool] 消息 #{message_id} 连续 {failures} 次投递失败，放弃这条并继续。"
-                )
-                self._failed_ids.pop(message_id, None)
-                delivered_upto = message_id
-
+            delivered_upto, retry_later = await self._deliver_round(pool, groups, messages, cursor)
             if delivered_upto != cursor:
                 cursor = delivered_upto
                 self._state["cursors"][pool] = cursor
@@ -526,14 +596,94 @@ class McChatPoolBridge(Star):
 
         return changed
 
-    async def _deliver(self, pool: str, groups: list[str], message: dict) -> bool | None:
-        """把一条游戏内消息发到该池绑定的所有群。
+    async def _deliver_round(
+        self, pool: str, groups: list[str], messages: list[dict], cursor: int
+    ) -> tuple[int, bool]:
+        """把本轮拉到的消息投递出去。
 
-        @return True=全部送达；False=尝试过但失败（可以计一次重试）；
-                None=平台还没连上，压根没尝试（不计重试，游标停住等连接）
+        条数达到 ``merge_forward_threshold`` 时整批走合并转发（失败会自动退化成逐条），
+        否则维持原来的逐条发送。
+
+        @return (已确认送达的最大消息 id, 是否本轮就此打住、留到下一轮重试)
         """
-        text = self._render(
-            self._str("mc_to_qq_format", "[MC] {sender}: {content}"),
+        if len(messages) >= self._merge_threshold():
+            outcome = await self._deliver_messages(pool, groups, messages)
+            if outcome is True:
+                for message in messages:
+                    self._failed_ids.pop(int(message.get("id") or 0), None)
+                self._deferred_warned[pool] = False
+                return int(messages[-1].get("id") or cursor), False
+            if outcome is None:
+                self._warn_deferred(pool, cursor)
+                return cursor, True
+            if self._note_failure(pool, messages, cursor, batch=True):
+                return int(messages[-1].get("id") or cursor), False
+            return cursor, True
+
+        delivered_upto = cursor
+        for message in messages:
+            message_id = int(message.get("id") or 0)
+            outcome = await self._deliver(pool, groups, message)
+            if outcome is True:
+                self._failed_ids.pop(message_id, None)
+                self._deferred_warned[pool] = False
+                delivered_upto = message_id
+                continue
+
+            if outcome is None:
+                # 平台还没连上：不算失败、不消耗重试次数，游标停住等下一轮。
+                self._warn_deferred(pool, delivered_upto)
+                return delivered_upto, True
+
+            if self._note_failure(pool, [message], delivered_upto, batch=False):
+                # 到重试上限了：放弃这条，继续处理后面的
+                delivered_upto = message_id
+                continue
+            return delivered_upto, True
+
+        return delivered_upto, False
+
+    def _warn_deferred(self, pool: str, cursor: int) -> None:
+        """平台还没连上时的提示，每个池只提示一次，避免每轮刷日志。"""
+        if self._deferred_warned.get(pool):
+            return
+        self._deferred_warned[pool] = True
+        logger.info(
+            f"[mc_chatpool] 平台尚未连接，暂停转发聊天池 {pool}（游标停在 {cursor}），"
+            "连上后会自动补发这些消息。"
+        )
+
+    def _note_failure(self, pool: str, messages: list[dict], delivered_upto: int, batch: bool) -> bool:
+        """记一次投递失败（单条或整批）。
+
+        @return True=已经到重试上限，放弃这些消息并继续推进游标；False=下一轮再试
+        """
+        ids = [int(message.get("id") or 0) for message in messages]
+        failures = (max(self._failed_ids.get(i, 0) for i in ids) + 1) if ids else 1
+        for message_id in ids:
+            self._failed_ids[message_id] = failures
+
+        what = f"消息 #{ids[0]}～#{ids[-1]}" if batch and len(ids) > 1 else f"消息 #{ids[0]}"
+        if failures < MAX_DELIVERY_RETRIES:
+            logger.warning(
+                f"[mc_chatpool] {what} 未送达（第 {failures}/{MAX_DELIVERY_RETRIES} 次），"
+                f"游标停在 {delivered_upto}，下一轮重试。"
+            )
+            return False
+
+        logger.error(f"[mc_chatpool] {what} 连续 {failures} 次投递失败，放弃这些消息并继续。")
+        for message_id in ids:
+            self._failed_ids.pop(message_id, None)
+        return True
+
+    def _message_text(self, pool: str, message: dict) -> str:
+        """按 mc_to_qq_format 渲染一条消息。
+
+        逐条发送、合并转发卡片里的内容、#mc history / #mc all 都走它，
+        保证占位符与观感完全一致。
+        """
+        return self._render(
+            self._str("mc_to_qq_format", DEFAULT_FORMAT),
             {
                 "pool": pool,
                 "sender": message.get("sender", "?"),
@@ -544,6 +694,14 @@ class McChatPoolBridge(Star):
                 "time": message.get("time", ""),
             },
         )
+
+    async def _deliver(self, pool: str, groups: list[str], message: dict) -> bool | None:
+        """把一条游戏内消息逐条发到该池绑定的所有群。
+
+        @return True=全部送达；False=尝试过但失败（可以计一次重试）；
+                None=平台还没连上，压根没尝试（不计重试，游标停住等连接）
+        """
+        text = self._message_text(pool, message)
         if not text.strip():
             return True
 
@@ -585,6 +743,255 @@ class McChatPoolBridge(Star):
             if delay > 0:
                 await asyncio.sleep(delay)
         return all_sent
+
+    # =============================================================== 合并转发
+
+    def _to_node(self, pool: str, message: dict):
+        """把一条游戏内消息转成合并转发卡片里的一个 node。
+
+        显示名用 MC 发送者名，内容用 mc_to_qq_format 的渲染结果——与逐条发送时
+        完全一致，所以同一条消息在两种模式下观感相同。
+        """
+        if Node is None:  # pragma: no cover - 老版本 AstrBot 没有合并转发组件
+            return None
+        sender = str(message.get("sender") or "?")
+        sender_id = str(message.get("sender_id") or "")
+        # user_id 是 node 的「发送者 QQ 号」。MC 玩家的 sender_id 是 UUID，
+        # 塞给协议端有可能让转发报文构造失败；实际显示的是昵称，
+        # 所以只在确实像 QQ 号时才带上，否则用组件默认的 "0"。
+        uin = sender_id if sender_id.isdigit() else "0"
+        return Node(content=[Plain(self._message_text(pool, message))], name=sender, uin=uin)
+
+    async def _send_forward(
+        self,
+        platform: str,
+        umo: str,
+        session_id: str,
+        is_group: bool,
+        nodes: list,
+        bot,
+        sender,
+    ) -> bool | None:
+        """把 nodes 以合并转发发出去（超过 merge_forward_max_nodes 会拆成多张卡片）。
+
+        路由：
+
+        * 群聊 → ``send_group_forward_msg``，私聊 → ``send_private_forward_msg``；
+        * 能拿到 bot 就自己 call_action——卡片标题（summary）是 action 的顶层参数，
+          AstrBot 的 Node/Nodes 组件不携带它，只有这条路径能设标题；
+        * 拿不到 bot 就退回 AstrBot 原生 ``Nodes`` 组件链，由框架自己按会话类型路由
+          （代价是没有标题）。
+
+        @param bot     aiocqhttp 的 bot 实例（可为 None）
+        @param sender  原生组件链的发送函数，签名 (MessageChain) -> awaitable
+        @return True=发出去了；False=失败（调用方负责兜底）；None=平台还没连上
+        """
+        if Nodes is None or not nodes:
+            return False
+        if self._platform_running(platform) is False:
+            return None
+
+        title = self._merge_title()
+        max_nodes = self._merge_max_nodes()
+        delay = self._as_int("send_interval_ms", 300, 0, 10000) / 1000.0
+        cards = [nodes[i:i + max_nodes] for i in range(0, len(nodes), max_nodes)]
+
+        for index, card in enumerate(cards, start=1):
+            try:
+                if bot is not None:
+                    payload = await Nodes(card).to_dict()
+                    if is_group:
+                        payload["group_id"] = session_id
+                    else:
+                        payload["user_id"] = session_id
+                    if title:
+                        # NapCat / OneBot 11 的扩展字段：合并转发卡片的外显标题（摘要）
+                        payload["summary"] = title
+                    action = FORWARD_ACTIONS[bool(is_group)]
+                    await bot.call_action(action, **payload)
+                    logger.info(
+                        f"[mc_chatpool] 已合并转发 {len(card)} 条到 {session_id}"
+                        f"（{action}，标题：{title or '（默认）'}）"
+                    )
+                else:
+                    sent = await sender(MessageChain([Nodes(card)]))
+                    if sent is False:
+                        logger.warning(
+                            f"[mc_chatpool] 平台 '{platform}' 下找不到会话 {umo}，合并转发没有送达。"
+                        )
+                        return False
+                    logger.info(f"[mc_chatpool] 已用原生组件合并转发 {len(card)} 条到 {session_id}")
+            except Exception as exc:  # noqa: BLE001 - 失败交给调用方兜底
+                name = type(exc).__name__
+                if name in DEFERRED_EXCEPTIONS:
+                    logger.info(f"[mc_chatpool] 平台还没准备好（{name}），稍后自动补发这批消息。")
+                    return None
+                logger.warning(f"[mc_chatpool] 合并转发到 {session_id} 失败：{name}: {exc!r}")
+                return False
+
+            if delay > 0 and index < len(cards):
+                await asyncio.sleep(delay)
+        return True
+
+    async def _deliver_merged(self, pool: str, groups: list[str], messages: list[dict]) -> bool | None:
+        """把一批消息以合并转发发到该池绑定的所有群。
+
+        任何一步失败都退回 ``_deliver_each`` 逐条发送，保证消息不丢。
+
+        @return True=全部送达；False=有失败；None=平台还没连上
+        """
+        platform = self._platform_id()
+        if self._platform_running(platform) is False:
+            return None
+        nodes = [node for node in (self._to_node(pool, m) for m in messages) if node is not None]
+        if not nodes:
+            return True
+
+        bot = self._bot_for(platform)
+        for group_id in groups:
+            umo = f"{platform}:GroupMessage:{group_id}"
+            outcome = await self._send_forward(
+                platform,
+                umo,
+                group_id,
+                True,
+                nodes,
+                bot,
+                (lambda chain, target=umo: self.context.send_message(target, chain)),
+            )
+            if outcome is None:
+                return None
+            if outcome is False:
+                logger.warning(
+                    f"[mc_chatpool] 聊天池 {pool} 的 {len(messages)} 条消息合并转发到群 "
+                    f"{group_id} 失败，改为逐条发送兜底。"
+                )
+                # 兜底时如果仍有部分失败，下一轮会把整批重发一遍：宁可重复也不丢消息，
+                # 与「游标只按确认送达推进」的既有策略一致。
+                return await self._deliver_each(pool, groups, messages)
+        return True
+
+    async def _deliver_each(self, pool: str, groups: list[str], messages: list[dict]) -> bool | None:
+        """一批消息逐条发送（合并转发的兜底路径）。
+
+        @return True=全部送达；False=有失败；None=平台还没连上
+        """
+        all_sent = True
+        for message in messages:
+            outcome = await self._deliver(pool, groups, message)
+            if outcome is None:
+                return None
+            if outcome is False:
+                all_sent = False
+        return all_sent
+
+    async def _deliver_messages(self, pool: str, groups: list[str], messages: list[dict]) -> bool | None:
+        """一批消息的投递入口：条数够多就合并转发，否则维持逐条发送。"""
+        if len(messages) >= self._merge_threshold():
+            return await self._deliver_merged(pool, groups, messages)
+        return await self._deliver_each(pool, groups, messages)
+
+    # =============================================================== 历史读取
+
+    async def _fetch_history(self, pool: str, limit: int, page_size: int) -> tuple[list[dict], int]:
+        """从该池最早保留的消息开始，分页拉取整段历史。
+
+        @param limit     最多拉多少条，0 = 不限制
+        @param page_size 每页条数（服务端接口上限 200）
+        @return (按 id 升序的消息列表, 该池当前最大 id)
+        """
+        exclude = self._str("poll_exclude_sources", "qq")
+        collected: list[dict] = []
+        since = 0
+        pool_cursor = 0
+        while True:
+            params = {"pool": pool, "since": since, "limit": page_size}
+            if exclude:
+                params["exclude_source"] = exclude
+            data = await self._api_get("/api/v1/messages", params)
+            if not data or not data.get("ok"):
+                break
+
+            pool_cursor = max(pool_cursor, int(data.get("pool_cursor") or 0))
+            messages = data.get("messages") or []
+            if not messages:
+                break
+
+            if limit:
+                remaining = limit - len(collected)
+                if remaining <= 0:
+                    break
+                messages = messages[:remaining]
+            collected.extend(messages)
+
+            newest = int(messages[-1].get("id") or since)
+            if newest <= since:  # 游标没前进：防死循环
+                break
+            since = newest
+            if not data.get("has_more") or (limit and len(collected) >= limit):
+                break
+        return collected, pool_cursor
+
+    async def _sync_full_history(self, pool: str, groups: list[str]) -> bool:
+        """read_all_history：首次同步就把该池保留的历史全部转发一遍。
+
+        分页拉取（``history_page_size``）→ 按 ``merge_forward_max_nodes`` 一批批投递
+        （每批都会走合并转发）→ 完成后把游标推进到该池最新位置，之后恢复增量。
+        总条数受 ``history_max_messages`` 限制（0 = 不限制），免得池子太大把群刷爆。
+
+        中途失败不推进到最新：剩下的会按普通增量补发，不会丢。
+
+        @return 游标是否有变化（与 _poll_pool 的约定一致）
+        """
+        budget = self._history_max_messages()
+        messages, pool_cursor = await self._fetch_history(pool, budget, self._history_page_size())
+        if not messages:
+            # 没有历史可回放：直接把游标定到当前位置，之后按增量走。
+            cursor = pool_cursor or 0
+            self._state["cursors"][pool] = cursor
+            logger.info(f"[mc_chatpool] 聊天池 {pool} 没有可回放的历史，游标从 {cursor} 开始。")
+            return True
+
+        logger.info(f"[mc_chatpool] 首次全量同步聊天池 {pool}：共 {len(messages)} 条历史，开始转发…")
+        # 每批取 max_nodes 与 threshold 的较大者：保证「每批都够阈值」从而真的走合并转发，
+        # 而 _send_forward 里再按 max_nodes 拆成多张卡片。
+        chunk_size = max(1, self._merge_max_nodes(), self._merge_threshold())
+        sent = 0
+        cursor = 0
+        for start in range(0, len(messages), chunk_size):
+            chunk = messages[start:start + chunk_size]
+            outcome = await self._deliver_messages(pool, groups, chunk)
+            if outcome is None:
+                logger.info(
+                    f"[mc_chatpool] 平台尚未连接，聊天池 {pool} 的全量同步停在第 {sent} 条，稍后继续。"
+                )
+                self._save_state(force=True)
+                return True
+            if outcome is False:
+                logger.warning(
+                    f"[mc_chatpool] 聊天池 {pool} 的全量同步在第 {sent} 条处失败，"
+                    "剩下的会按增量补发。"
+                )
+                self._save_state(force=True)
+                return True
+
+            sent += len(chunk)
+            cursor = int(chunk[-1].get("id") or cursor)
+            # 每批都落盘：中途被打断也能从断点继续
+            self._state["cursors"][pool] = cursor
+            self._save_state()
+            await asyncio.sleep(0)
+
+        if budget and len(messages) >= budget and pool_cursor > cursor:
+            logger.warning(
+                f"[mc_chatpool] 聊天池 {pool} 的历史超过 history_max_messages={budget}，"
+                f"还有 {pool_cursor - cursor} 条没有回放（避免刷屏），游标直接推进到最新。"
+            )
+        cursor = max(cursor, pool_cursor)
+        self._state["cursors"][pool] = cursor
+        self._save_state(force=True)
+        logger.info(f"[mc_chatpool] 聊天池 {pool} 全量同步完成：转发 {sent} 条，游标推进到 {cursor}。")
+        return True
 
     @staticmethod
     def _render(template: str, values: dict) -> str:
@@ -646,6 +1053,8 @@ class McChatPoolBridge(Star):
             await self._reply(event, await self._pools_text())
         elif command == "history":
             await self._reply(event, await self._history_text(group_id, rest))
+        elif command == "all":
+            await self._export_all(event, group_id, rest)
         elif command == "bind":
             await self._reply(event, await self._bind(event, group_id, rest))
         elif command == "unbind":
@@ -716,21 +1125,83 @@ class McChatPoolBridge(Star):
 
         lines = [f"🕘 聊天池 {pool} 最近 {len(messages)} 条："]
         for message in messages:
-            lines.append(
-                self._render(
-                    self._str("mc_to_qq_format", "[MC] {sender}: {content}"),
-                    {
-                        "pool": pool,
-                        "sender": message.get("sender", "?"),
-                        "sender_id": message.get("sender_id", ""),
-                        "content": message.get("content", ""),
-                        "id": message.get("id", ""),
-                        "source": message.get("source", "mc"),
-                        "time": message.get("time", ""),
-                    },
-                )
-            )
+            lines.append(self._message_text(pool, message))
         return "\n".join(lines)
+
+    def _parse_all_args(self, group_id: str, rest: str) -> tuple[str, int]:
+        """解析 ``#mc all [池] [条数]`` 的参数。
+
+        @return (池名, 条数)；条数 0 表示「全部」（再受 history_max_messages 限制）
+        """
+        pool = self._pool_for_group(group_id)
+        count = 0
+        parts = rest.split()
+        if parts:
+            if parts[0].isdigit():
+                count = int(parts[0])
+            else:
+                pool = parts[0].lower()
+                if len(parts) > 1 and parts[1].isdigit():
+                    count = int(parts[1])
+        return pool, max(0, count)
+
+    async def _export_all(self, event: AstrMessageEvent, group_id: str, rest: str) -> None:
+        """#mc all [池] [条数]：把该池历史以合并转发导出到当前会话（群或私聊）。
+
+        与自动转发的区别：这里**无论多少条都用合并转发**（导出语义），
+        并且只影响当前会话，不动任何池的拉取游标。
+        """
+        pool, count = self._parse_all_args(group_id, rest)
+        budget = self._history_max_messages()  # 0 = 不限制
+        exclude = self._str("poll_exclude_sources", "qq")
+
+        if count and count <= 200:
+            # 「最后 N 条」直接用接口的 tail 模式（不带 since）：服务端返回的就是最新的 N 条。
+            params = {"pool": pool, "limit": count}
+            if exclude:
+                params["exclude_source"] = exclude
+            data = await self._api_get("/api/v1/messages", params)
+            if not data or not data.get("ok"):
+                await self._reply(event, f"❌ 拉取聊天池 {pool} 的历史失败。")
+                return
+            messages = data.get("messages") or []
+        else:
+            # 「全部」或超过接口单页上限：从最早保留的消息开始分页，再取最后 N 条。
+            messages, _ = await self._fetch_history(pool, budget, self._history_page_size())
+            if count:
+                messages = messages[-count:]
+
+        if not messages:
+            await self._reply(event, f"聊天池 {pool} 没有可导出的历史消息。")
+            return
+
+        is_group = bool(event.get_group_id())
+        session_id = str(event.get_group_id() or event.get_sender_id() or "")
+        platform = self._platform_id()
+        nodes = [node for node in (self._to_node(pool, m) for m in messages) if node is not None]
+        if not nodes:
+            await self._reply(event, "❌ 当前 AstrBot 版本不支持合并转发组件，无法导出。")
+            return
+
+        outcome = await self._send_forward(
+            platform,
+            event.unified_msg_origin,
+            session_id,
+            is_group,
+            nodes,
+            self._bot_for(platform, event),
+            event.send,
+        )
+        if outcome is True:
+            await self._reply(event, f"📤 已导出聊天池 {pool} 的 {len(messages)} 条历史（合并转发）。")
+            return
+        if outcome is None:
+            await self._reply(event, "⏳ 机器人还没连上，稍后再试。")
+            return
+
+        logger.warning("[mc_chatpool] #mc all 合并转发失败，改为逐条发送兜底。")
+        for message in messages:
+            await self._reply(event, self._message_text(pool, message))
 
     async def _bind(self, event: AstrMessageEvent, group_id: str, rest: str) -> str:
         if not self._is_admin(event):

@@ -3,6 +3,37 @@
 本文件记录每个版本的变更。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [未发布]
+
+### 新增
+
+- **全量读取历史**（`read_all_history`，默认 `false`）：打开后某个池**首次**同步不再跳过历史，
+  而是从服务器保留的最早一条开始按 `history_page_size`（默认 200）分页拉取并转发到群，
+  总量受 `history_max_messages`（默认 2000，`0` = 不限制）约束；完成后游标推进到该池最新位置，
+  之后自动恢复增量。中途失败不会跳到最新，剩余部分按增量补发，不会丢消息。
+- **合并转发**：一轮要发的消息达到 `merge_forward_threshold`（默认 6）时，不再逐条刷屏，
+  改为打包成 QQ 的「合并转发」卡片——群聊 `send_group_forward_msg`、
+  私聊 `send_private_forward_msg`。卡片内每条 node 的显示名是 MC 发送者名，内容仍是
+  `mc_to_qq_format` 的渲染结果，观感与逐条发送一致；超过 `merge_forward_max_nodes`
+  （默认 100）自动拆成多张卡片依次发；卡片外显标题由 `merge_forward_title`
+  （默认「MC 聊天记录」，即协议里的 `summary`）控制。
+- **`#mc all [池] [条数]`**：随时把某个池的历史以合并转发导出到当前会话；
+  缺省 = 本群绑定的池 + 全部条数（受 `history_max_messages` 限制）。
+- **失败兜底**：合并转发失败（协议端报错、平台未就绪等）自动退化成逐条发送并记 warning，
+  不会丢消息。
+
+### 变更
+
+- `mc_to_qq_format` 的渲染收敛到单一入口，逐条发送 / 合并转发 node / `#mc history` / `#mc all` 共用，
+  保证同一套占位符与观感。
+- 默认行为与 1.0.0 完全一致：新配置项的默认值下，小批量消息仍然是逐条发送、首次同步仍然跳过历史。
+
+### 测试
+
+- 离线自测从 38 项扩到 66 项，新增覆盖：合并转发阈值判断、node 构造与 `max_nodes` 拆分、
+  卡片标题（`summary`）字段、`#mc all` 参数解析与导出、全量分页累积与上限截断、
+  `read_all_history` 首次回放、合并转发失败的逐条兜底路径。
+
 ## [1.0.0] - 2026-10-12
 
 首个版本，在 AstrBot 4.28.2 + NapCat（Docker 部署）+ Paper 26.2 上实测通过。

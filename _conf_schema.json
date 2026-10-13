@@ -39,13 +39,49 @@
     "description": "插件启动时不回放历史消息",
     "type": "bool",
     "default": true,
-    "hint": "开启后首次拉取只记录游标位置，把服务器里已有的旧消息跳过，避免一启动就刷屏。"
+    "hint": "开启后首次拉取只记录游标位置，把服务器里已有的旧消息跳过，避免一启动就刷屏。read_all_history 打开时本项不生效。"
+  },
+  "read_all_history": {
+    "description": "首次同步时读取全部历史消息",
+    "type": "bool",
+    "default": false,
+    "hint": "打开后，某个聊天池第一次同步时不再跳过历史，而是从服务器保留的最早一条开始分页拉取并转发到群，完成后游标推进到最新，之后恢复增量。历史很多时会用合并转发，不会逐条刷屏。"
+  },
+  "history_page_size": {
+    "description": "全量同步时每页拉取条数",
+    "type": "int",
+    "default": 200,
+    "hint": "只在 read_all_history 或 #mc all 需要分页时使用；服务端接口的 limit 上限就是 200。"
+  },
+  "history_max_messages": {
+    "description": "单次全量同步最多处理多少条",
+    "type": "int",
+    "default": 2000,
+    "hint": "防止池子太大把群刷爆；0 = 不限制。达到上限后剩余的历史不再回放，游标直接推进到最新（日志里会有提示）。"
   },
   "send_interval_ms": {
     "description": "消息发送间隔（毫秒）",
     "type": "int",
     "default": 300,
-    "hint": "每条消息之间等待的时间，防止触发 QQ 风控。"
+    "hint": "每条消息之间等待的时间，防止触发 QQ 风控；合并转发拆成多张卡片时，卡片之间也会等这么久。"
+  },
+  "merge_forward_threshold": {
+    "description": "合并转发阈值",
+    "type": "int",
+    "default": 6,
+    "hint": "一轮要发的消息达到这个数量就打包成 QQ 的「合并转发」卡片；少于它维持逐条发送。设为 1 表示总是合并转发。"
+  },
+  "merge_forward_max_nodes": {
+    "description": "单张合并转发卡片最多几条",
+    "type": "int",
+    "default": 100,
+    "hint": "超过就拆成多张卡片依次发送。"
+  },
+  "merge_forward_title": {
+    "description": "合并转发卡片标题",
+    "type": "string",
+    "default": "MC 聊天记录",
+    "hint": "卡片外显的标题（NapCat 的 summary 字段）。留空则不设置，用 QQ 的默认样式。"
   },
   "platform_id": {
     "description": "平台适配器 ID",
