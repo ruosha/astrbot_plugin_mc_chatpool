@@ -40,6 +40,16 @@ QQ 的「合并转发」卡片（NapCat 的 ``send_group_forward_msg`` / ``send_
 完成后把游标推进到该池最新位置，之后恢复增量。群里也可以用 ``#mc all [池] [条数]``
 随时把历史以合并转发导出到当前会话。
 
+推送接收端（push 模式）
+======================
+
+MC 服务器搬到别的机器后，让 AstrBot 跨网络去「拉」它可能不方便（NAT/防火墙）。
+``enable_receive`` 打开后插件自带一个很小的 HTTP 服务，接收 paper 插件主动
+``POST`` 过来的单条消息：校验 token → 按池攒 ``receive_merge_window_ms`` 毫秒 →
+交给与轮询**完全相同**的 ``_deliver_messages``，所以合并转发、失败兜底、渲染全都自动复用。
+接收端只监听 ``receive_bind``:``receive_port``（默认 0.0.0.0:6198，容器内），
+建议只映射到宿主回环；``receive_token`` 必须设置，否则出于安全考虑不启动。
+
 落盘
 ====
 
@@ -50,12 +60,18 @@ QQ 的「合并转发」卡片（NapCat 的 ``send_group_forward_msg`` / ``send_
 from __future__ import annotations
 
 import asyncio
+import hmac
 import json
 import re
 import time
 from pathlib import Path
 
 import aiohttp
+
+try:  # 推送接收端需要 aiohttp.web；离线自测环境里没有它也不影响其它功能
+    from aiohttp import web as aiohttp_web
+except Exception:  # noqa: BLE001 - pragma: no cover
+    aiohttp_web = None  # type: ignore[assignment]
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
@@ -92,6 +108,9 @@ PLACEHOLDER = re.compile(r"\{(\w+)\}")
 #: 一条消息最多重试投递多少次；超过就放弃这条并继续推进游标，避免卡死。
 #: 用于兜住「平台连接抖动」这类瞬时故障；平台压根没连上时不计入次数。
 MAX_DELIVERY_RETRIES = 10
+
+#: 推送接收端允许的最大请求体：单条消息远小于它，超了直接 413（web 层与业务层各挡一次）。
+MAX_PUSH_BODY_BYTES = 64 * 1024
 
 #: 这些异常表示「平台还没握手完」，属于暂时不可用：挂起重试，不消耗重试次数。
 #: ApiNotAvailable 是 AstrBot aiocqhttp 适配器在反向 WS 未就绪时抛出的。
@@ -151,6 +170,21 @@ class McChatPoolBridge(Star):
         # 已经因为「平台没连上」提醒过的池，避免每轮都刷日志
         self._deferred_warned: dict[str, bool] = {}
 
+        # ---- 推送接收端（push 模式）：paper 主动 POST 过来 ----
+        self._receive_runner = None                       # aiohttp web.AppRunner
+        self._receive_site = None                         # aiohttp web.TCPSite
+        self._receive_buffers: dict[str, list[dict]] = {}  # 池 -> 攒批中的消息
+        self._receive_timers: dict[str, asyncio.Task] = {}  # 池 -> 窗口定时任务
+        self._receive_tasks: set[asyncio.Task] = set()      # 投递中的后台任务
+        self._receive_stats: dict[str, int] = {
+            "received": 0,
+            "queued": 0,
+            "delivered": 0,
+            "failed": 0,
+            "skipped": 0,
+            "rejected": 0,
+        }
+
     # ================================================================= 生命周期
 
     async def initialize(self) -> None:
@@ -176,6 +210,11 @@ class McChatPoolBridge(Star):
         else:
             logger.info("[mc_chatpool] enable_poll=false，只处理群内命令，不主动拉取消息。")
 
+        if self._receive_enabled():
+            await self._start_receive_server()
+        else:
+            logger.info("[mc_chatpool] enable_receive=false，未启动推送接收端。")
+
         logger.info(f"[mc_chatpool] 插件已就绪，数据文件：{self._state_file}")
 
     async def terminate(self) -> None:
@@ -186,6 +225,8 @@ class McChatPoolBridge(Star):
             except (asyncio.CancelledError, Exception):  # noqa: BLE001 - 关停时吞掉所有异常
                 pass
             self._poll_task = None
+
+        await self._stop_receive_server()
 
         if self._session is not None and not self._session.closed:
             await self._session.close()
@@ -240,6 +281,44 @@ class McChatPoolBridge(Star):
     def _merge_title(self) -> str:
         """合并转发卡片的外显标题（NapCat 的 summary 字段）。"""
         return self._str("merge_forward_title", "MC 聊天记录")
+
+    # ---- 推送接收端（push 模式）的配置读取 ----
+
+    def _receive_enabled(self) -> bool:
+        """是否开启内置的推送接收端。"""
+        return self._as_bool("enable_receive", False)
+
+    def _receive_bind(self) -> str:
+        """容器内监听地址（默认 0.0.0.0，靠端口映射限制对外暴露）。"""
+        return self._str("receive_bind", "0.0.0.0") or "0.0.0.0"
+
+    def _receive_port(self) -> int:
+        """容器内监听端口。"""
+        return self._as_int("receive_port", 6198, 1, 65535)
+
+    def _receive_path(self) -> str:
+        """接收路径：统一成以 / 开头、去掉结尾多余的 /。"""
+        raw = self._str("receive_path", "/mc-chatpool/push") or "/mc-chatpool/push"
+        if not raw.startswith("/"):
+            raw = "/" + raw
+        return raw.rstrip("/") or "/mc-chatpool/push"
+
+    def _receive_token(self) -> str:
+        """推送鉴权 token；为空时不启动接收端。"""
+        return self._str("receive_token", "")
+
+    def _receive_window_ms(self) -> int:
+        """攒批窗口（毫秒）：窗口内收到的多条合并成一次投递，突发消息自然走合并转发。"""
+        return self._as_int("receive_merge_window_ms", 800, 0, 60_000)
+
+    def _receive_max_batch(self) -> int:
+        """单批最多多少条，达到就先投递，再继续攒下一批。"""
+        return self._as_int("receive_max_batch", 200, 1, 10_000)
+
+    def _receive_skip_sources(self) -> set[str]:
+        """收到这些来源的推送直接丢弃（默认丢掉 qq，避免群里发的话被推回来刷屏）。"""
+        raw = self._str("receive_skip_sources", "qq")
+        return {item.strip().lower() for item in re.split(r"[,，、\s]+", raw) if item.strip()}
 
     def _base_url(self) -> str:
         url = self._str("mc_base_url", "http://127.0.0.1:8123")
@@ -890,6 +969,260 @@ class McChatPoolBridge(Star):
         if len(messages) >= self._merge_threshold():
             return await self._deliver_merged(pool, groups, messages)
         return await self._deliver_each(pool, groups, messages)
+
+    # ============================================================= 推送接收端
+    #
+    # MC 服务器搬到别的机器后，跨网络去「拉」它可能不方便，于是让 paper 插件主动
+    # POST 单条消息过来。接收端只做三件事：校验、攒批、把整批交给上面那套已有的
+    # _deliver_messages —— 合并转发、失败兜底、渲染全部复用，没有第二套发送逻辑。
+
+    def _push_token_ok(self, auth_header: str | None) -> bool:
+        """校验请求头：必须是 ``Bearer <receive_token>``（常量时间比较）。"""
+        expected = self._receive_token()
+        if not expected:
+            return False
+        value = (auth_header or "").strip()
+        if value[:7].lower() != "bearer ":
+            return False
+        return hmac.compare_digest(value[7:].strip(), expected)
+
+    def _handle_push_request(self, raw_body: bytes, auth_header: str | None) -> tuple[int, dict]:
+        """处理一次推送，返回 ``(HTTP 状态码, 响应体)``。
+
+        校验顺序：体积 → token → JSON → 必填字段 → 有没有绑定群 → 来源是否跳过 → 入队攒批。
+        刻意做成不碰 HTTP、不 await 的纯函数，HTTP 层只负责取请求体、写回结果，
+        这样每条分支都能离线测到（见 tests/test_offline.py）。
+        """
+        self._receive_stats["received"] += 1
+
+        if len(raw_body or b"") > MAX_PUSH_BODY_BYTES:
+            self._receive_stats["rejected"] += 1
+            return 413, {"ok": False, "error": "body too large"}
+        if not self._push_token_ok(auth_header):
+            self._receive_stats["rejected"] += 1
+            return 401, {"ok": False, "error": "unauthorized"}
+        try:
+            payload = json.loads((raw_body or b"").decode("utf-8"))
+        except (UnicodeDecodeError, ValueError):
+            self._receive_stats["rejected"] += 1
+            return 400, {"ok": False, "error": "invalid JSON"}
+        if not isinstance(payload, dict):
+            self._receive_stats["rejected"] += 1
+            return 400, {"ok": False, "error": "body must be a JSON object"}
+
+        pool = str(payload.get("pool") or "").strip().lower()
+        if not pool:
+            self._receive_stats["rejected"] += 1
+            return 400, {"ok": False, "error": "pool is required"}
+        content = payload.get("content")
+        if content is None or not str(content).strip():
+            self._receive_stats["rejected"] += 1
+            return 400, {"ok": False, "error": "content is required"}
+
+        groups = self._bridges().get(pool) or []
+        if not groups:
+            self._receive_stats["skipped"] += 1
+            return 200, {"ok": True, "queued": 0, "reason": "no binding"}
+
+        source = str(payload.get("source") or "mc").strip().lower()
+        if source in self._receive_skip_sources():
+            self._receive_stats["skipped"] += 1
+            return 200, {"ok": True, "queued": 0, "reason": "skipped source"}
+
+        self._queue_push(pool, {
+            "id": payload.get("id"),
+            "pool": pool,
+            "source": source,
+            "sender": str(payload.get("sender") or "MC"),
+            "sender_id": str(payload.get("sender_id") or ""),
+            "content": str(content),
+            "time": str(payload.get("time") or ""),
+            "time_ms": payload.get("time_ms"),
+        })
+        return 200, {"ok": True, "queued": 1}
+
+    # ------------------------------------------------------------ 攒批与投递
+
+    def _queue_push(self, pool: str, message: dict) -> None:
+        """把一条消息放进该池的攒批缓冲：满一批立刻投递，否则等窗口到期。"""
+        buffer = self._receive_buffers.setdefault(pool, [])
+        buffer.append(message)
+        self._receive_stats["queued"] += 1
+        if len(buffer) >= self._receive_max_batch():
+            self._flush_push(pool)
+        else:
+            self._arm_push_timer(pool)
+
+    def _arm_push_timer(self, pool: str) -> None:
+        """（重新）启动窗口定时器：每来一条就重置，从最后一条开始计时。"""
+        existing = self._receive_timers.pop(pool, None)
+        if existing is not None:
+            existing.cancel()
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return  # 没有事件循环时由调用方负责 flush
+        task = loop.create_task(self._push_timer(pool))
+        self._receive_timers[pool] = task
+
+    async def _push_timer(self, pool: str) -> None:
+        """等攒批窗口到期，然后把这一批交出去。"""
+        try:
+            await asyncio.sleep(self._receive_window_ms() / 1000.0)
+            self._flush_push(pool)
+        except asyncio.CancelledError:
+            raise  # 被新消息重置窗口，或插件正在关停
+        except Exception as exc:  # noqa: BLE001 - 定时器出错不能拖垮接收端
+            logger.warning(f"[mc_chatpool] 推送攒批定时器出错：{type(exc).__name__}: {exc!r}")
+
+    def _flush_push(self, pool: str) -> asyncio.Task | None:
+        """把该池攒下的消息交给 ``_deliver_messages``，返回后台投递任务。
+
+        全程不 await：HTTP 响应不等投递结果；单批失败只记日志，不影响后续批次。
+        """
+        timer = self._receive_timers.pop(pool, None)
+        if timer is not None:
+            timer.cancel()
+        messages = self._receive_buffers.pop(pool, [])
+        if not messages:
+            return None
+        groups = self._bridges().get(pool) or []
+        if not groups:
+            self._receive_stats["skipped"] += len(messages)
+            return None
+        try:
+            task = asyncio.get_running_loop().create_task(self._deliver_push_batch(pool, groups, messages))
+        except RuntimeError:
+            # 没有事件循环（极简环境）：先放回缓冲，等下次有循环时再投，不阻塞调用方
+            self._receive_buffers.setdefault(pool, []).extend(messages)
+            return None
+        self._receive_tasks.add(task)
+        task.add_done_callback(self._receive_tasks.discard)
+        return task
+
+    async def _deliver_push_batch(self, pool: str, groups: list[str], messages: list[dict]) -> bool | None:
+        """投递一批推送消息；任何异常都只记日志，绝不让接收端挂掉。"""
+        try:
+            outcome = await self._deliver_messages(pool, groups, messages)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - 单批失败不能影响后续批次
+            self._receive_stats["failed"] += len(messages)
+            logger.warning(
+                f"[mc_chatpool] 推送投递失败（池 {pool}，{len(messages)} 条）："
+                f"{type(exc).__name__}: {exc!r}"
+            )
+            return False
+        if outcome is None:
+            self._receive_stats["failed"] += len(messages)
+            logger.info(f"[mc_chatpool] 平台还没准备好，推送的 {len(messages)} 条已丢弃（池 {pool}）。")
+        elif outcome is False:
+            self._receive_stats["failed"] += len(messages)
+            logger.warning(f"[mc_chatpool] 推送的 {len(messages)} 条没能全部送达（池 {pool}）。")
+        else:
+            self._receive_stats["delivered"] += len(messages)
+            logger.info(f"[mc_chatpool] 推送投递完成：池 {pool}，{len(messages)} 条。")
+        return outcome
+
+    # ---------------------------------------------------------------- HTTP 层
+
+    async def _push_handler(self, request):
+        """POST 接收入口：薄封装，逻辑全在 ``_handle_push_request`` 里。"""
+        status, body = 500, {"ok": False, "error": "internal error"}
+        try:
+            raw = await request.read()
+            status, body = self._handle_push_request(raw, request.headers.get("Authorization"))
+        except Exception as exc:  # noqa: BLE001 - handler 绝不能把异常抛回 aiohttp
+            if type(exc).__name__ == "HTTPRequestEntityTooLarge":
+                # 超过 web 层 client_max_size 的请求体：按协议回 413（而不是 500）
+                status, body = 413, {"ok": False, "error": "body too large"}
+            else:
+                logger.warning(f"[mc_chatpool] 处理推送请求出错：{type(exc).__name__}: {exc!r}")
+        try:
+            return aiohttp_web.json_response(body, status=status)
+        except Exception:  # pragma: no cover - 极端情况下也别抛
+            return aiohttp_web.Response(status=status, text=json.dumps(body, ensure_ascii=False))
+
+    async def _push_health(self, request):
+        """GET 健康检查（同样要 token），方便探活与排查。"""
+        if not self._push_token_ok(request.headers.get("Authorization")):
+            return aiohttp_web.json_response({"ok": False, "error": "unauthorized"}, status=401)
+        return aiohttp_web.json_response({
+            "ok": True,
+            "plugin": PLUGIN_NAME,
+            "mode": "push",
+            "buffered": {pool: len(items) for pool, items in self._receive_buffers.items() if items},
+            "stats": dict(self._receive_stats),
+        })
+
+    async def _start_receive_server(self) -> None:
+        """启动内置接收端；任何失败都只记 warning，插件继续按拉取模式工作。"""
+        if aiohttp_web is None:
+            logger.warning("[mc_chatpool] 当前环境没有 aiohttp.web，推送接收端无法启动（拉取模式不受影响）。")
+            return
+        if not self._receive_token():
+            logger.warning(
+                "[mc_chatpool] enable_receive=true 但 receive_token 为空，"
+                "出于安全考虑不启动推送接收端（不带鉴权的写接口不能对外开）。"
+            )
+            return
+
+        bind, port, path = self._receive_bind(), self._receive_port(), self._receive_path()
+        # client_max_size 放宽到上限的两倍：这样 64KB~128KB 的请求还能走到业务层，
+        # 由 _handle_push_request 统一给出 JSON 格式的 413，而不是 aiohttp 的纯文本 413。
+        app = aiohttp_web.Application(client_max_size=MAX_PUSH_BODY_BYTES * 2)
+        app.router.add_post(path, self._push_handler)
+        app.router.add_get(path + "/health", self._push_health)
+        runner = aiohttp_web.AppRunner(app, access_log=None)
+        try:
+            await runner.setup()
+            site = aiohttp_web.TCPSite(runner, bind, port)
+            await site.start()
+        except Exception as exc:  # noqa: BLE001 - 端口占用等都不能让插件崩
+            logger.warning(
+                f"[mc_chatpool] 推送接收端启动失败（{type(exc).__name__}: {exc}），"
+                "继续以轮询模式工作；请检查 receive_port 是否被占用、receive_bind 是否合法。"
+            )
+            try:
+                await runner.cleanup()
+            except Exception:  # noqa: BLE001
+                pass
+            return
+        self._receive_runner = runner
+        self._receive_site = site
+        logger.info(
+            f"[mc_chatpool] 推送接收端已启动：http://{bind}:{port}{path}"
+            f"（需要 Authorization: Bearer <receive_token>）"
+        )
+
+    async def _stop_receive_server(self) -> None:
+        """优雅关闭接收端：先停攒批与投递任务，再清理 aiohttp runner，不卡住退出。"""
+        for timer in list(self._receive_timers.values()):
+            timer.cancel()
+        self._receive_timers.clear()
+
+        pending = {pool: len(items) for pool, items in self._receive_buffers.items() if items}
+        self._receive_buffers.clear()
+        if pending:
+            logger.warning(f"[mc_chatpool] 关闭时丢弃了还没投递的推送消息：{pending}")
+
+        for task in list(self._receive_tasks):
+            task.cancel()
+        if self._receive_tasks:
+            logger.info(
+                f"[mc_chatpool] 关闭时有 {len(self._receive_tasks)} 批推送正在投递，已中止（不等待退出）。"
+            )
+            await asyncio.gather(*list(self._receive_tasks), return_exceptions=True)
+        self._receive_tasks.clear()
+
+        runner, self._receive_runner = self._receive_runner, None
+        self._receive_site = None
+        if runner is not None:
+            try:
+                await runner.cleanup()
+                logger.info("[mc_chatpool] 推送接收端已关闭。")
+            except Exception as exc:  # noqa: BLE001 - 关停失败也不能抛
+                logger.warning(f"[mc_chatpool] 关闭推送接收端时出错：{type(exc).__name__}: {exc!r}")
 
     # =============================================================== 历史读取
 

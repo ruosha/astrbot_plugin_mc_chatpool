@@ -62,6 +62,14 @@ git clone https://github.com/ruosha/astrbot_plugin_mc_chatpool.git
 | `merge_forward_threshold` | `6` | 一轮要发的消息 ≥ 这个数就改用**合并转发**，少于它仍然逐条发 |
 | `merge_forward_max_nodes` | `100` | 单张合并转发卡片最多几条，超出拆成多张依次发 |
 | `merge_forward_title` | `MC 聊天记录` | 合并转发卡片的外显标题，留空则不设置（用 QQ 默认样式） |
+| `enable_receive` | `false` | **推送模式**：开启内置 HTTP 接收端，让 paper 插件主动把消息推过来（MC 服务器在别的机器上时用，详见 4.2） |
+| `receive_bind` | `0.0.0.0` | 接收端在容器内的监听地址；只映射宿主机回环即可 |
+| `receive_port` | `6198` | 接收端在容器内的端口 |
+| `receive_path` | `/mc-chatpool/push` | 接收路径（健康检查为同路径 + `/health`） |
+| `receive_token` | 空 | **必填**：请求需带 `Authorization: Bearer <token>`；留空则不启动接收端 |
+| `receive_merge_window_ms` | `800` | 攒批窗口：窗口内收到的多条合并成一次投递（于是自动走合并转发） |
+| `receive_max_batch` | `200` | 单批最多多少条，达到就先投递再继续攒 |
+| `receive_skip_sources` | `qq` | 丢弃这些来源的推送，默认丢 `qq` 避免回环刷屏 |
 | `platform_id` | `auto` | 平台适配器 ID。**建议保持 auto 自动探测**：AstrBot 里平台实例的 ID 是用户自己起的名字，写死成 `aiocqhttp` 会报 `cannot find platform for session` 而发不出消息 |
 | `bridges` | 示例值 | **必填**：`聊天池 = 群号1, 群号2`，每行一条 |
 | `enable_group_to_mc` | `true` | 允许群内命令往服务器发消息 |
@@ -116,7 +124,7 @@ tech = 555555
    * 看到「🟢 Minecraft 服务器在线」说明链路通了；
    * 看到 `❌ 连不上…` 就按第 5 节排查。
 
-### AstrBot 跑在 Docker 里
+### 4.1 AstrBot 跑在 Docker 里
 
 容器里的 `127.0.0.1` 是容器自己，所以 `mc_base_url` 要指向宿主机：
 
@@ -125,6 +133,52 @@ tech = 555555
   能直接访问宿主机回环端口上监听的 8123。
 * **Linux 上的 Docker / 自定义 bridge 网络**：通常访问不到宿主机回环端口，
   这时把服务端插件的 `http.host` 改成宿主机内网 IP（或 `0.0.0.0` + 强 token）。
+
+### 4.2 用推送模式（MC 服务器在别的机器上）
+
+轮询要求 AstrBot 能访问到 paper 插件的 HTTP 接口；如果 MC 服务器在 NAT 后面、或者你不想在那台机器上开端口，
+可以反过来：让 paper 插件把消息**推**给 AstrBot。
+
+1. 插件配置里打开 `enable_receive`，设一个足够随机的 `receive_token`（**留空不会启动接收端**）；
+   不再需要轮询就把 `enable_poll` 关掉 —— 两者同时开着，同一条消息会被推一次、又被拉一次。
+2. 端口映射你自己在 `compose.yml` 里加（插件不会替你改），**只绑宿主机回环**：
+
+   ```yaml
+   ports:
+     - "127.0.0.1:6198:6198"     # 别写 "6198:6198"，那等于把写接口暴露到公网
+   ```
+
+3. 先手工验证一次：
+
+   ```bash
+   curl -sS -X POST http://127.0.0.1:6198/mc-chatpool/push \
+     -H "Authorization: Bearer <receive_token>" \
+     -H "Content-Type: application/json" \
+     -d '{"pool":"global","id":42,"source":"mc","sender":"Steve","sender_id":"<uuid>",
+          "content":"hi","time":"2026-10-13T18:00:00Z","time_ms":1791814442927}'
+   # → {"ok": true, "queued": 1}
+   ```
+
+   健康检查（同样要 token，能看到攒批与统计计数）：
+   `curl -H "Authorization: Bearer <receive_token>" http://127.0.0.1:6198/mc-chatpool/push/health`
+
+响应语义：
+
+| 情况 | 响应 |
+|---|---|
+| 正常接收（该池有绑定群、来源没被跳过） | `200 {"ok":true,"queued":1}` |
+| token 缺失或不匹配 | `401 {"ok":false,"error":"unauthorized"}` |
+| 不是合法 JSON / 不是 JSON 对象 / 缺 `pool` 或 `content` | `400`，`error` 里说明原因 |
+| 该池没有绑定任何群 | `200 {"ok":true,"queued":0,"reason":"no binding"}` |
+| 来源命中 `receive_skip_sources`（默认 `qq`） | `200 {"ok":true,"queued":0,"reason":"skipped source"}` |
+| 请求体超过 64 KB | `413 {"ok":false,"error":"body too large"}` |
+
+* **攒批**：同一个池在 `receive_merge_window_ms` 内收到的消息会合成一批，一次性交给投递链，
+  所以突发消息自动走**合并转发**而不是逐条刷屏；攒到 `receive_max_batch` 就先投递、再继续攒。
+* **投递**：完全复用轮询那条链路（同一套渲染、合并转发、失败兜底）；投递在后台任务里跑，
+  HTTP 响应不等它，单批失败只记 warning、不影响后面的批次。
+* **安全**：未鉴权的接收端等于把「往你群里发消息」的接口交出去，所以 `receive_token` 为空时
+  插件不会启动接收端；跨机器请走 ssh 反向隧道之类的加密通道，不要在公网裸奔。
 
 ---
 
@@ -188,11 +242,17 @@ tech = 555555
 python tests/test_offline.py
 ```
 
-覆盖 66 项断言：桥接配置解析（行格式 / JSON）、占位符渲染与防二次替换、群命令分发与权限、
+覆盖 98 项断言：桥接配置解析（行格式 / JSON）、占位符渲染与防二次替换、群命令分发与权限、
 消息截断、轮询游标与 `has_more` 连拉、平台 ID 自动探测、投递失败不推进游标与重试上限、
 合并转发阈值判断与 `max_nodes` 拆分、卡片标题（`summary`）字段、node 构造、
 合并转发失败的逐条兜底、全量分页累积与 `history_max_messages` 截断、
-`read_all_history` 首次回放、`#mc all` 参数解析与导出。
+`read_all_history` 首次回放、`#mc all` 参数解析与导出，以及**推送接收端**——
+token 校验（缺失 / 错误 / 缺 `Bearer` 前缀）、坏 JSON 与缺字段、超 64 KB、未绑定池、
+来源跳过、攒批窗口与 `receive_max_batch`、投递异常隔离、端口被占用与关停清理。
+
+> 接收端的校验与攒批逻辑被抽成了不碰 HTTP 的纯函数（`_handle_push_request`），
+> 所以离线自测不需要真起 HTTP 服务；HTTP 层（真实 aiohttp 绑定、状态码、时序、关停后端口释放）
+> 另外在容器里用真 aiohttp + 真 AstrBot 跑过一轮。
 
 ---
 

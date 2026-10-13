@@ -21,18 +21,45 @@
   缺省 = 本群绑定的池 + 全部条数（受 `history_max_messages` 限制）。
 - **失败兜底**：合并转发失败（协议端报错、平台未就绪等）自动退化成逐条发送并记 warning，
   不会丢消息。
+- **推送接收端（push 模式）**：`enable_receive`（默认 `false`）打开后，插件自带一个小 HTTP 服务
+  （`receive_bind` / `receive_port` / `receive_path`，默认 `0.0.0.0:6198/mc-chatpool/push`），
+  接收 paper 插件主动 `POST` 过来的单条消息，用来替代「AstrBot 去拉 MC 服务器」——
+  适合 MC 服务器搬到别的机器、AstrBot 跨网络拉不到它的场景。
+  - 鉴权：`receive_token` **必填**，请求需带 `Authorization: Bearer <token>`（否则 `401`，
+    常量时间比较）；token 为空时出于安全考虑**不启动**接收端。
+  - 校验：请求体 ≤ 64 KB（超出 `413`）、合法 JSON 对象（否则 `400`）、`pool`/`content` 必填
+    （否则 `400`）、池没有绑定群 → `200 {"queued":0,"reason":"no binding"}`、
+    来源命中 `receive_skip_sources`（默认 `qq`）→ `200 {"queued":0,"reason":"skipped source"}`。
+  - 攒批：同一个池在 `receive_merge_window_ms`（默认 800ms）内收到的消息合并成一批，
+    达到 `receive_max_batch`（默认 200）先投递再继续攒；整批交给**现有**的投递链路，
+    因此合并转发、失败兜底、渲染完全复用。
+  - 投递在后台任务里执行，HTTP 响应不等结果；单批失败只记 warning，不影响后续批次；
+    端口被占用等启动失败只记 warning，插件继续按轮询模式工作。
+  - 关停时优雅清理（取消定时器与投递任务 → `runner.cleanup()`），不阻塞 AstrBot 退出。
 
 ### 变更
 
 - `mc_to_qq_format` 的渲染收敛到单一入口，逐条发送 / 合并转发 node / `#mc history` / `#mc all` 共用，
   保证同一套占位符与观感。
 - 默认行为与 1.0.0 完全一致：新配置项的默认值下，小批量消息仍然是逐条发送、首次同步仍然跳过历史。
+- 推送模式与轮询模式并存时可能重复投递（同一条消息被推一次、又被拉一次）：README 已写明
+  建议二选一，或让 paper 端不要推送 `qq` 来源（默认就跳过）。
 
 ### 测试
 
-- 离线自测从 38 项扩到 66 项，新增覆盖：合并转发阈值判断、node 构造与 `max_nodes` 拆分、
+- 离线自测从 38 项扩到 **98 项**。其中 66 项覆盖合并转发阈值判断、node 构造与 `max_nodes` 拆分、
   卡片标题（`summary`）字段、`#mc all` 参数解析与导出、全量分页累积与上限截断、
-  `read_all_history` 首次回放、合并转发失败的逐条兜底路径。
+  `read_all_history` 首次回放、合并转发失败的逐条兜底路径；
+  新增 **32 项**覆盖推送接收端：token 缺失 / 错误 / 缺 `Bearer` 前缀 → `401`，
+  坏 JSON、非对象 JSON、缺 `pool`/`content`、`content` 全空白 → `400`，超 64 KB → `413`，
+  未绑定池与 `qq` 来源 → `queued=0`，正常入队攒批、池名大小写不敏感、窗口内不投递、
+  窗口到期把整批交给 `_deliver_messages`（用桩断言调用参数）、达到 `receive_max_batch` 立即投递、
+  单批投递抛异常不影响下一批、平台未就绪时不抛异常、缺少 `aiohttp.web` 时不启动也不抛错、
+  启动成功后注册路由并记住 runner、端口被占用时不抛异常且清理已建立的 runner、
+  `receive_token` 为空时不启动、关停时 `runner.cleanup()` 被调用且窗口定时器被取消、
+  未投递缓冲被丢弃。
+- HTTP 层本身（真实 aiohttp 服务、状态码、攒批与时序、关停后端口不可达）另外在容器里
+  用真 aiohttp + 真 astrbot 跑了一遍，未依赖离线桩件。
 
 ## [1.0.0] - 2026-10-12
 

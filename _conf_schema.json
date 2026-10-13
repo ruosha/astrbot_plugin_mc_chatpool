@@ -59,6 +59,54 @@
     "default": 2000,
     "hint": "防止池子太大把群刷爆；0 = 不限制。达到上限后剩余的历史不再回放，游标直接推进到最新（日志里会有提示）。"
   },
+  "enable_receive": {
+    "description": "【推送模式】启用内置推送接收端",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后插件会自己起一个小 HTTP 服务，接收 paper 插件主动 POST 过来的消息，适合 MC 服务器在网络另一头、AstrBot 拉不到它的情况。与轮询同时开会重复投递，用推送时建议把 enable_poll 关掉。"
+  },
+  "receive_bind": {
+    "description": "推送接收端监听地址（容器内）",
+    "type": "string",
+    "default": "0.0.0.0",
+    "hint": "容器内监听地址。安全起见只把端口映射到宿主机回环（compose 里写 \"127.0.0.1:6198:6198\"），不要直接暴露到公网。"
+  },
+  "receive_port": {
+    "description": "推送接收端监听端口（容器内）",
+    "type": "int",
+    "default": 6198,
+    "hint": "容器内端口。改了这里，compose 的端口映射与 paper 端的推送地址要一起改。"
+  },
+  "receive_path": {
+    "description": "推送接收路径",
+    "type": "string",
+    "default": "/mc-chatpool/push",
+    "hint": "POST 到这个路径即投递一条消息；健康检查在同路径 + /health（GET，同样需要 token）。"
+  },
+  "receive_token": {
+    "description": "【必填】推送鉴权 token",
+    "type": "string",
+    "default": "",
+    "hint": "请求必须带 Authorization: Bearer <token>，否则 401。留空时出于安全考虑不会启动接收端。建议用一长串随机字符，并与 paper 端保持一致。"
+  },
+  "receive_merge_window_ms": {
+    "description": "推送攒批窗口（毫秒）",
+    "type": "int",
+    "default": 800,
+    "hint": "窗口内收到的多条合并成一次投递，所以突发消息会自动走合并转发而不是逐条刷屏。0 = 收到就投（不攒批）。"
+  },
+  "receive_max_batch": {
+    "description": "单批推送最多多少条",
+    "type": "int",
+    "default": 200,
+    "hint": "攒到这个数量就先投递，再继续攒下一批，避免消息无限堆积。"
+  },
+  "receive_skip_sources": {
+    "description": "丢弃这些来源的推送",
+    "type": "string",
+    "default": "qq",
+    "hint": "逗号分隔。默认丢掉 qq —— paper 端若把「QQ 群注入的消息」也推过来，不丢就会被原样发回群里造成刷屏。"
+  },
   "send_interval_ms": {
     "description": "消息发送间隔（毫秒）",
     "type": "int",

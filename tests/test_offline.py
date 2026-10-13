@@ -838,6 +838,267 @@ def main() -> int:
     )
     plugin.config["skip_backlog_on_first_poll"] = True
 
+    # ============================================================ 推送接收端（push 模式）
+    #
+    # 接收端刻意把「校验 + 攒批」抽成 _handle_push_request（不碰 HTTP、不 await），
+    # 所以这里不需要起真的 HTTP 服务就能把每条分支测到；HTTP 层是薄封装，
+    # 它的真实行为另外在容器里用真 aiohttp 跑过（见交付说明）。
+
+    plugin.config.update({
+        "enable_receive": True,
+        "receive_bind": "127.0.0.1",
+        "receive_port": 6198,
+        "receive_path": "/mc-chatpool/push",
+        "receive_token": "push-token",
+        "receive_merge_window_ms": 150,
+        "receive_max_batch": 200,
+        "receive_skip_sources": "qq",
+    })
+    plugin._config_bridges = {"global": ["123456789"], "tech": ["555555"]}
+
+    # 配置读取
+    check("推送：默认 bind/port", plugin._receive_bind() == "127.0.0.1" and plugin._receive_port() == 6198)
+    check("推送：路径原样保留", plugin._receive_path() == "/mc-chatpool/push")
+    plugin.config["receive_path"] = "no-slash/push/"
+    check("推送：路径自动补前导斜杠并去掉结尾斜杠", plugin._receive_path() == "/no-slash/push")
+    plugin.config["receive_path"] = "/mc-chatpool/push"
+    plugin.config["receive_skip_sources"] = "qq, mc、console"
+    check("推送：skip_sources 多值解析", plugin._receive_skip_sources() == {"qq", "mc", "console"})
+    plugin.config["receive_skip_sources"] = "qq"
+
+    def push(raw, header):
+        return plugin._handle_push_request(raw, header)
+
+    def push_json(token="push-token", **payload):
+        header = f"Bearer {token}" if token else None
+        return push(json.dumps(payload, ensure_ascii=False).encode("utf-8"), header)
+
+    good = json.dumps({"pool": "global", "id": 1, "source": "mc", "sender": "Steve",
+                       "sender_id": "u-1", "content": "hi"}, ensure_ascii=False).encode("utf-8")
+
+    # 校验顺序：token → JSON → 必填字段 → 绑定 → 来源
+    code, body = push(good, "Bearer push-token")
+    check("推送：正常 -> 200 queued=1", code == 200 and body == {"ok": True, "queued": 1}, f"{code} {body}")
+    check("推送：缺 token -> 401", push(good, None)[0] == 401)
+    check("推送：错 token -> 401", push(good, "Bearer wrong")[0] == 401)
+    check("推送：不带 Bearer 前缀 -> 401", push(good, "push-token")[0] == 401)
+    check("推送：坏 JSON -> 400", push(b"{not json", "Bearer push-token")[0] == 400)
+    check("推送：JSON 不是对象 -> 400", push(b"[1,2,3]", "Bearer push-token")[0] == 400)
+    check("推送：缺 pool -> 400", push_json(content="x")[0] == 400)
+    check("推送：缺 content -> 400", push_json(pool="global")[0] == 400)
+    check("推送：content 全空白 -> 400", push_json(pool="global", content="   ")[0] == 400)
+    big = b'{"pool":"global","content":"' + b"a" * (65536 + 10) + b'"}'
+    check("推送：超过 64KB -> 413", push(big, "Bearer push-token")[0] == 413)
+    code, body = push_json(pool="nosuchpool", content="x")
+    check("推送：未绑定池 -> queued=0 no binding", code == 200 and body.get("reason") == "no binding", str(body))
+    code, body = push_json(pool="global", content="x", source="qq")
+    check("推送：qq 来源被跳过", code == 200 and body.get("reason") == "skipped source", str(body))
+    code, body = push_json(pool="GLOBAL", content="大小写不敏感")
+    check("推送：池名大小写不敏感", code == 200 and body.get("queued") == 1, str(body))
+    check("推送：正常消息进了攒批缓冲", len(plugin._receive_buffers.get("global", [])) == 2,
+          str(plugin._receive_buffers))
+
+    # 攒批窗口：窗口内不投递，到期后整批交给已有的 _deliver_messages
+    delivered: list = []
+
+    async def record_deliver(pool, groups, messages):
+        delivered.append((pool, list(groups), [(m["id"], m["content"]) for m in messages]))
+        return True
+
+    plugin._deliver_messages = record_deliver
+
+    def reset_push_state():
+        for timer in list(plugin._receive_timers.values()):
+            timer.cancel()
+        plugin._receive_timers.clear()
+        plugin._receive_buffers.clear()
+        delivered.clear()
+
+    async def window_flow():
+        for i in (1, 2, 3):
+            plugin._handle_push_request(
+                json.dumps({"pool": "global", "id": i, "sender": "S", "content": f"m{i}"}).encode("utf-8"),
+                "Bearer push-token",
+            )
+        inside = len(delivered)
+        await asyncio.sleep(0.45)   # 等窗口（150ms）到期
+        return inside
+
+    reset_push_state()
+    inside = asyncio.run(window_flow())
+    check("推送：窗口内不投递", inside == 0, str(delivered))
+    check(
+        "推送：窗口到期后整批交给 _deliver_messages",
+        len(delivered) == 1
+        and delivered[0][0] == "global"
+        and delivered[0][1] == ["123456789"]
+        and [content for _, content in delivered[0][2]] == ["m1", "m2", "m3"],
+        str(delivered),
+    )
+
+    # 达到 receive_max_batch 立即投递
+    async def batch_flow():
+        plugin.config["receive_max_batch"] = 2
+        plugin._handle_push_request(
+            json.dumps({"pool": "global", "id": 10, "content": "b1"}).encode("utf-8"), "Bearer push-token")
+        plugin._handle_push_request(
+            json.dumps({"pool": "global", "id": 11, "content": "b2"}).encode("utf-8"), "Bearer push-token")
+        await asyncio.sleep(0.1)
+
+    reset_push_state()
+    asyncio.run(batch_flow())
+    check(
+        "推送：达到 receive_max_batch 立即投递",
+        len(delivered) == 1 and [content for _, content in delivered[0][2]] == ["b1", "b2"],
+        str(delivered),
+    )
+
+    # 投递抛异常：记 warning、不影响下一批
+    async def error_flow():
+        async def boom(pool, groups, messages):
+            raise RuntimeError("模拟投递炸了")
+
+        plugin.config["receive_max_batch"] = 1
+        plugin._deliver_messages = boom
+        plugin._handle_push_request(
+            json.dumps({"pool": "global", "id": 20, "content": "bad"}).encode("utf-8"), "Bearer push-token")
+        await asyncio.sleep(0.1)
+        plugin._deliver_messages = record_deliver
+        plugin._handle_push_request(
+            json.dumps({"pool": "global", "id": 21, "content": "good"}).encode("utf-8"), "Bearer push-token")
+        await asyncio.sleep(0.1)
+
+    reset_push_state()
+    asyncio.run(error_flow())
+    check(
+        "推送：单批投递抛异常不影响下一批",
+        len(delivered) == 1 and delivered[0][2] == [(21, "good")],
+        str(delivered),
+    )
+
+    # 投递被延迟（平台没连上）也只是记日志
+    async def deferred_flow():
+        async def deferred(pool, groups, messages):
+            return None
+
+        plugin._deliver_messages = deferred
+        plugin._handle_push_request(
+            json.dumps({"pool": "global", "id": 30, "content": "later"}).encode("utf-8"), "Bearer push-token")
+        await asyncio.sleep(0.1)
+
+    reset_push_state()
+    asyncio.run(deferred_flow())
+    check("推送：平台未就绪时按失败统计且不抛异常", plugin._receive_stats["failed"] >= 1)
+
+    # 没有 aiohttp.web 的离线环境：不启动、不抛错
+    plugin._receive_runner = None
+    asyncio.run(plugin._start_receive_server())
+    check("推送：缺少 aiohttp.web 时不启动也不抛错", plugin._receive_runner is None)
+
+    # 用假的 aiohttp.web 覆盖「启动成功」与「端口被占用」两条路径
+    created_runners: list = []
+
+    class FakeRouter:
+        def __init__(self):
+            self.posts: list = []
+            self.gets: list = []
+
+        def add_post(self, path, handler):
+            self.posts.append(path)
+
+        def add_get(self, path, handler):
+            self.gets.append(path)
+
+    class FakeApplication:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            self.router = FakeRouter()
+
+    class FakeRunner:
+        def __init__(self, app, **kwargs):
+            self.app = app
+            self.cleaned = 0
+            created_runners.append(self)
+
+        async def setup(self):
+            return None
+
+        async def cleanup(self):
+            self.cleaned += 1
+
+    class FakeSite:
+        fail = False
+
+        def __init__(self, runner, bind, port):
+            self.runner = runner
+            self.bind = bind
+            self.port = port
+
+        async def start(self):
+            if FakeSite.fail:
+                raise OSError("address already in use")
+
+    fake_web = types.ModuleType("fake_web")
+    fake_web.Application = FakeApplication
+    fake_web.AppRunner = FakeRunner
+    fake_web.TCPSite = FakeSite
+
+    module.aiohttp_web = fake_web
+    FakeSite.fail = False
+    created_runners.clear()
+    plugin._receive_runner = None
+    asyncio.run(plugin._start_receive_server())
+    check("推送：启动成功后记住 runner 与注册路由",
+          plugin._receive_runner is created_runners[-1]
+          and created_runners[-1].app.router.posts == ["/mc-chatpool/push"]
+          and created_runners[-1].app.router.gets == ["/mc-chatpool/push/health"],
+          str(created_runners[-1].app.router.posts))
+
+    FakeSite.fail = True
+    created_runners.clear()
+    plugin._receive_runner = None
+    asyncio.run(plugin._start_receive_server())     # 端口被占用：不能抛
+    check("推送：端口被占用时不抛异常且不留下 runner", plugin._receive_runner is None)
+    check("推送：启动失败时清理已建立的 runner",
+          bool(created_runners) and created_runners[-1].cleaned == 1,
+          str([r.cleaned for r in created_runners]))
+
+    # 没配 token 时不启动（未鉴权的写接口不能开）
+    FakeSite.fail = False
+    created_runners.clear()
+    plugin.config["receive_token"] = ""
+    asyncio.run(plugin._start_receive_server())
+    check("推送：receive_token 为空时不启动接收端", plugin._receive_runner is None and not created_runners)
+    plugin.config["receive_token"] = "push-token"
+    module.aiohttp_web = None
+
+    # 关停：runner 被 cleanup，定时器被取消，攒批被丢弃
+    class FakeRunner:
+        def __init__(self):
+            self.cleaned = 0
+
+        async def cleanup(self):
+            self.cleaned += 1
+
+    class FakeTimer:
+        def __init__(self):
+            self.cancelled = 0
+
+        def cancel(self):
+            self.cancelled += 1
+
+    fake_runner = FakeRunner()
+    fake_timer = FakeTimer()
+    reset_push_state()
+    plugin._receive_runner = fake_runner
+    plugin._receive_buffers["global"] = [{"id": 99, "content": "pending"}]
+    plugin._receive_timers["global"] = fake_timer
+    asyncio.run(plugin._stop_receive_server())
+    check("推送：关停时 runner.cleanup() 被调用", fake_runner.cleaned == 1, str(fake_runner.cleaned))
+    check("推送：关停时窗口定时器被取消", fake_timer.cancelled >= 1, str(fake_timer.cancelled))
+    check("推送：关停时 runner 引用被清空", plugin._receive_runner is None)
+    check("推送：关停时丢弃未投递的缓冲", not plugin._receive_buffers.get("global"))
+
     print()
     print(f"全部通过：{len(PASSED)} 项")
     return 0
